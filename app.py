@@ -3,13 +3,20 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# ==========================================
+# 1. CREDENCIAIS OMIE
+# ==========================================
 APP_KEY_ORIGEM = "1724630275368"
 APP_SECRET_ORIGEM = "549a26b527f429912abf81f18570030e"
+
 APP_KEY_DESTINO = "5102721230607"
 APP_SECRET_DESTINO = "e3e98a53e601102596075966c6c5f5a1"
 
 OMIE_API_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 
+# ==========================================
+# 2. FUNÇÃO DE TRANSFERÊNCIA
+# ==========================================
 def transferir_pedido_omie(codigo_pedido_origem):
     payload_consulta = {
         "call": "ConsultarPedido",
@@ -17,39 +24,59 @@ def transferir_pedido_omie(codigo_pedido_origem):
         "app_secret": APP_SECRET_ORIGEM,
         "param": [{"codigo_pedido": codigo_pedido_origem}]
     }
-    pedido = requests.post(OMIE_API_URL, json=payload_consulta).json()
     
-    if "faultstring" in pedido:
-        print(f"Erro na origem: {pedido['faultstring']}")
+    # 1. Busca na Origem
+    pedido_origem_bruto = requests.post(OMIE_API_URL, json=payload_consulta).json()
+    
+    # Imprime exatamente o que a origem mandou para não ficarmos cegos
+    print(f"📦 DADOS DA ORIGEM: {pedido_origem_bruto}")
+    
+    if "faultstring" in pedido_origem_bruto:
+        print(f"Erro na origem: {pedido_origem_bruto['faultstring']}")
         return False
 
-    if "cabecalho" in pedido:
-        pedido["cabecalho"].pop("codigo_pedido", None)
-        cod_int = pedido["cabecalho"].get("codigo_pedido_integracao", str(codigo_pedido_origem))
-        pedido["cabecalho"]["codigo_pedido_integracao"] = f"{cod_int}-ATIVA"
+    # 2. Desempacotador Inteligente (resolve o erro da tag cabecalho)
+    # Se o Omie retornar o pedido dentro da chave 'pedido_venda_produto', ele extrai.
+    pedido = pedido_origem_bruto.get("pedido_venda_produto", pedido_origem_bruto)
+
+    # Trava de segurança
+    if "cabecalho" not in pedido:
+        print("❌ ERRO INTERNO: O pedido desempacotado não possui a tag [cabecalho].")
+        return False
+
+    # 3. Limpeza para Inclusão no Destino
+    pedido["cabecalho"].pop("codigo_pedido", None)
+    cod_int = pedido["cabecalho"].get("codigo_pedido_integracao", str(codigo_pedido_origem))
+    pedido["cabecalho"]["codigo_pedido_integracao"] = f"{cod_int}-ATIVA"
         
     if "det" in pedido:
         for item in pedido["det"]:
             item.get("ide", {}).pop("codigo_item_pedido", None)
             
-    for chave in ["infoCadastro", "departamentos"]:
+    # Removemos abas exclusivas de leitura e controle interno do Omie
+    for chave in ["infoCadastro", "departamentos", "observacoes"]:
         pedido.pop(chave, None)
 
+    # 4. Envio para a ATIVA
     payload_inclusao = {
         "call": "IncluirPedido",
         "app_key": APP_KEY_DESTINO,
         "app_secret": APP_SECRET_DESTINO,
         "param": [pedido]
     }
+    
     resultado = requests.post(OMIE_API_URL, json=payload_inclusao).json()
     
     if "codigo_pedido" in resultado:
-        print(f"✅ SUCESSO! Pedido transferido. Novo ID: {resultado['codigo_pedido']}")
+        print(f"✅ SUCESSO! Pedido transferido para ATIVA. Novo ID: {resultado['codigo_pedido']}")
         return True
     else:
         print(f"❌ ERRO DO OMIE (ATIVA): {resultado}")
         return False
 
+# ==========================================
+# 3. ROTA DO WEBHOOK
+# ==========================================
 @app.route('/webhook/omie', methods=['POST'])
 def receber_webhook():
     payload = request.json

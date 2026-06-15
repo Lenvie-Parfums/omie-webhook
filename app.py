@@ -3,36 +3,26 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ==========================================
-# 1. CREDENCIAIS OMIE (PREENCHA AQUI)
-# ==========================================
-APP_KEY_ORIGEM = "1724630275368"
-APP_SECRET_ORIGEM = "549a26b527f429912abf81f18570030e"
-
-APP_KEY_DESTINO = "5102721230607"
-APP_SECRET_DESTINO = "e3e98a53e601102596075966c6c5f5a1"
+APP_KEY_ORIGEM = "SUA_CHAVE_ORIGEM"
+APP_SECRET_ORIGEM = "SEU_SECRET_ORIGEM"
+APP_KEY_DESTINO = "SUA_CHAVE_ATIVA"
+APP_SECRET_DESTINO = "SEU_SECRET_ATIVA"
 
 OMIE_API_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 
-# ==========================================
-# 2. FUNÇÃO DE TRANSFERÊNCIA
-# ==========================================
 def transferir_pedido_omie(codigo_pedido_origem):
-    # Consulta na Origem
     payload_consulta = {
         "call": "ConsultarPedido",
         "app_key": APP_KEY_ORIGEM,
         "app_secret": APP_SECRET_ORIGEM,
         "param": [{"codigo_pedido": codigo_pedido_origem}]
     }
-    
-    req_origem = requests.post(OMIE_API_URL, json=payload_consulta)
-    pedido = req_origem.json()
+    pedido = requests.post(OMIE_API_URL, json=payload_consulta).json()
     
     if "faultstring" in pedido:
+        print(f"Erro na origem: {pedido['faultstring']}")
         return False
 
-    # Limpeza dos IDs de controle (Origem -> Destino)
     if "cabecalho" in pedido:
         pedido["cabecalho"].pop("codigo_pedido", None)
         cod_int = pedido["cabecalho"].get("codigo_pedido_integracao", str(codigo_pedido_origem))
@@ -40,33 +30,29 @@ def transferir_pedido_omie(codigo_pedido_origem):
         
     if "det" in pedido:
         for item in pedido["det"]:
-            if "ide" in item:
-                item["ide"].pop("codigo_item_pedido", None)
-                
+            item.get("ide", {}).pop("codigo_item_pedido", None)
+            
     for chave in ["infoCadastro", "departamentos"]:
         pedido.pop(chave, None)
 
-    # Inclusão no Destino (ATIVA)
     payload_inclusao = {
         "call": "IncluirPedido",
         "app_key": APP_KEY_DESTINO,
         "app_secret": APP_SECRET_DESTINO,
         "param": [pedido]
     }
+    resultado = requests.post(OMIE_API_URL, json=payload_inclusao).json()
     
-    req_destino = requests.post(OMIE_API_URL, json=payload_inclusao)
-    resultado = req_destino.json()
-    
-    return "codigo_pedido" in resultado
+    if "codigo_pedido" in resultado:
+        print(f"✅ SUCESSO! Pedido transferido. Novo ID: {resultado['codigo_pedido']}")
+        return True
+    else:
+        print(f"❌ ERRO DO OMIE (ATIVA): {resultado}")
+        return False
 
-# ==========================================
-# 3. ROTA DO WEBHOOK (GATILHO)
-# ==========================================
 @app.route('/webhook/omie', methods=['POST'])
 def receber_webhook():
     payload = request.json
-    
-    # Resposta de validação inicial do Omie
     if payload and payload.get('ping'):
         return jsonify({"status": "ok"}), 200
 
@@ -74,15 +60,11 @@ def receber_webhook():
     codigo_pedido = mensagem.get('idPedido')
     etapa_atual = str(mensagem.get('etapa', ''))
 
-    # Trava: Só executa se for etapa 80
     if etapa_atual == "80":
+        print(f"⏳ Tentando transferir pedido {codigo_pedido}...")
         sucesso = transferir_pedido_omie(codigo_pedido)
-        if sucesso:
-            return jsonify({"status": "transferido"}), 200
-        else:
-            return jsonify({"status": "erro"}), 500
-            
-    # Ignora outras etapas
+        return jsonify({"status": "transferido" if sucesso else "erro"}), 200 if sucesso else 500
+        
     return jsonify({"status": "ignorado"}), 200
 
 if __name__ == '__main__':

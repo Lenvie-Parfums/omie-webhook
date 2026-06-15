@@ -1,16 +1,12 @@
-import requests
-from flask import Flask, request, jsonify
-
-app = Flask(__name__)
 
 # ==========================================
-# 1. CREDENCIAIS OMIE
+# 1. CREDENCIAIS OMIE (PREENCHA AQUI)
 # ==========================================
 APP_KEY_ORIGEM = "1724630275368"
 APP_SECRET_ORIGEM = "549a26b527f429912abf81f18570030e"
 
 APP_KEY_DESTINO = "5102721230607"
-APP_SECRET_DESTINO = "e3e98a53e601102596075966c6c5f5a1"
+APP_SECRET_DESTINO = "549a26b527f429912abf81f18570030e"
 
 OMIE_API_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 
@@ -25,39 +21,41 @@ def transferir_pedido_omie(codigo_pedido_origem):
         "param": [{"codigo_pedido": codigo_pedido_origem}]
     }
     
-    # 1. Busca na Origem
+    # Busca na Origem
     pedido_origem_bruto = requests.post(OMIE_API_URL, json=payload_consulta).json()
-    
-    # Imprime exatamente o que a origem mandou para não ficarmos cegos
     print(f"📦 DADOS DA ORIGEM: {pedido_origem_bruto}")
     
     if "faultstring" in pedido_origem_bruto:
         print(f"Erro na origem: {pedido_origem_bruto['faultstring']}")
         return False
 
-    # 2. Desempacotador Inteligente (resolve o erro da tag cabecalho)
-    # Se o Omie retornar o pedido dentro da chave 'pedido_venda_produto', ele extrai.
+    # Desempacotador
     pedido = pedido_origem_bruto.get("pedido_venda_produto", pedido_origem_bruto)
 
-    # Trava de segurança
     if "cabecalho" not in pedido:
         print("❌ ERRO INTERNO: O pedido desempacotado não possui a tag [cabecalho].")
         return False
 
-    # 3. Limpeza para Inclusão no Destino
+    # Limpeza profunda de IDs exclusivos da origem
     pedido["cabecalho"].pop("codigo_pedido", None)
+    pedido["cabecalho"].pop("codigo_cenario_impostos", None)
+    
     cod_int = pedido["cabecalho"].get("codigo_pedido_integracao", str(codigo_pedido_origem))
     pedido["cabecalho"]["codigo_pedido_integracao"] = f"{cod_int}-ATIVA"
+    
+    if "informacoes_adicionais" in pedido:
+        pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
         
     if "det" in pedido:
         for item in pedido["det"]:
             item.get("ide", {}).pop("codigo_item_pedido", None)
+            item.get("inf_adic", {}).pop("codigo_local_estoque", None)
+            item.get("inf_adic", {}).pop("codigo_cenario_impostos_item", None)
             
-    # Removemos abas exclusivas de leitura e controle interno do Omie
-    for chave in ["infoCadastro", "departamentos", "observacoes"]:
+    for chave in ["infoCadastro", "departamentos", "observacoes", "total_pedido"]:
         pedido.pop(chave, None)
 
-    # 4. Envio para a ATIVA
+    # Envio para a ATIVA
     payload_inclusao = {
         "call": "IncluirPedido",
         "app_key": APP_KEY_DESTINO,

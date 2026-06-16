@@ -199,6 +199,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
         pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
         # Conta corrente e obrigatoria e tem ID interno proprio na ATIVA.
         pedido["informacoes_adicionais"]["codigo_conta_corrente"] = CONTA_CORRENTE_PADRAO
+        # Vendedor (codVend) tem ID interno na FRI que nao existe na ATIVA.
+        # Removido no teste; mapear/cadastrar depois se necessario.
+        pedido["informacoes_adicionais"].pop("codVend", None)
     else:
         pedido["informacoes_adicionais"] = {
             "codigo_categoria": CATEGORIA_PADRAO,

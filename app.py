@@ -21,9 +21,8 @@ ETAPA_GATILHO = "80"
 # o pedido deve entrar numa etapa inicial valida. Ajuste se necessario.
 ETAPA_ENTRADA_DESTINO = "10"
 # Categoria (plano de contas) usada quando o pedido da FRI nao traz uma.
-# Formato Omie: "X.XX.XX". Veja as categorias validas da ATIVA acessando
-# a rota /categorias deste servico. Ajuste para a categoria de venda correta.
-CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.01")
+# 1.01.02 = "Venda Atacado - Representantes" (fluxo dos representantes).
+CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 
 
 # ==========================================================
@@ -173,13 +172,11 @@ def transferir_pedido_omie(codigo_pedido_origem):
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
-        # NAO removemos codigo_categoria: a ATIVA exige. Preservamos o da FRI;
-        # se vier vazio, aplicamos um padrao configuravel.
-        cat_atual = pedido["informacoes_adicionais"].get("codigo_categoria")
-        if not cat_atual:
-            pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
+        # Forca a categoria correta da ATIVA. O plano de contas da FRI pode ter
+        # codigos iguais com significado diferente, entao nao herdamos da origem.
+        # Todos esses pedidos sao de representantes -> 1.01.02.
+        pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
     else:
-        # Garante o bloco com a categoria, caso a FRI nao envie informacoes_adicionais
         pedido["informacoes_adicionais"] = {"codigo_categoria": CATEGORIA_PADRAO}
 
     # Transportadora tambem pode vir aninhada no bloco frete.

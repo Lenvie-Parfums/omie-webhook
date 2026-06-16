@@ -23,6 +23,9 @@ ETAPA_ENTRADA_DESTINO = "10"
 # Categoria (plano de contas) usada quando o pedido da FRI nao traz uma.
 # 1.01.02 = "Venda Atacado - Representantes" (fluxo dos representantes).
 CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
+# Conta corrente (ID numerico) da ATIVA para lancar o pedido.
+# Descubra o ID valido acessando a rota /contas deste servico e ajuste aqui.
+CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "0"))
 
 
 # ==========================================================
@@ -171,13 +174,17 @@ def transferir_pedido_omie(codigo_pedido_origem):
     cab.pop("codigo_transportadora", None)
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
-        pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
         # Forca a categoria correta da ATIVA. O plano de contas da FRI pode ter
         # codigos iguais com significado diferente, entao nao herdamos da origem.
         # Todos esses pedidos sao de representantes -> 1.01.02.
         pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
+        # Conta corrente e obrigatoria e tem ID interno proprio na ATIVA.
+        pedido["informacoes_adicionais"]["codigo_conta_corrente"] = CONTA_CORRENTE_PADRAO
     else:
-        pedido["informacoes_adicionais"] = {"codigo_categoria": CATEGORIA_PADRAO}
+        pedido["informacoes_adicionais"] = {
+            "codigo_categoria": CATEGORIA_PADRAO,
+            "codigo_conta_corrente": CONTA_CORRENTE_PADRAO,
+        }
 
     # Transportadora tambem pode vir aninhada no bloco frete.
     if "frete" in pedido and isinstance(pedido["frete"], dict):
@@ -237,6 +244,29 @@ def receber_webhook():
         return jsonify({"status": "transferido" if sucesso else "erro"}), 200
 
     return jsonify({"status": "ignorado"}), 200
+
+
+@app.route('/contas', methods=['GET'])
+def listar_contas():
+    # Lista as contas correntes da ATIVA para voce escolher o ID
+    # e colocar em CONTA_CORRENTE_PADRAO.
+    url = "https://app.omie.com.br/api/v1/geral/contacorrente/"
+    resp = chamar_omie(
+        url, "ListarContasCorrentes",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"pagina": 1, "registros_por_pagina": 100}
+    )
+    contas = resp.get("ListarContasCorrentes", resp.get("conta_corrente_lista", []))
+    enxuto = [
+        {
+            "nCodCC": c.get("nCodCC"),
+            "descricao": c.get("descricao"),
+            "tipo": c.get("tipo_conta_corrente"),
+        }
+        for c in contas
+    ]
+    return jsonify({"raw": resp if not enxuto else None,
+                    "total": len(enxuto), "contas": enxuto}), 200
 
 
 @app.route('/', methods=['GET', 'HEAD'])

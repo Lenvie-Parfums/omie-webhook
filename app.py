@@ -221,21 +221,60 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if "frete" in pedido and isinstance(pedido["frete"], dict):
         pedido["frete"].pop("codigo_transportadora", None)
 
-    # --- 4.5 Limpeza por item (preserva SKU e descricao p/ o destino resolver) ---
+    # --- 4.4b Cache de produtos da ATIVA (SKU -> codigo_produto) ---
+    # A Omie exige codigo_produto ou codigo_produto_integracao. O ID da FRI
+    # nao vale na ATIVA, entao consultamos o produto la pelo SKU.
+    cache_produtos = {}
+
+    def resolver_produto_ativa(sku):
+        if sku in cache_produtos:
+            return cache_produtos[sku]
+        # Tenta buscar pelo codigo (SKU) na ATIVA
+        resp = chamar_omie(
+            "https://app.omie.com.br/api/v1/geral/produtos/",
+            "ConsultarProduto",
+            APP_KEY_DESTINO, APP_SECRET_DESTINO,
+            {"codigo_produto_integracao": sku}
+        )
+        cod = resp.get("codigo_produto")
+        # Se nao achou por integracao, tenta pelo codigo interno via ListarProdutos
+        if not cod:
+            resp2 = chamar_omie(
+                "https://app.omie.com.br/api/v1/geral/produtos/",
+                "ListarProdutos",
+                APP_KEY_DESTINO, APP_SECRET_DESTINO,
+                {"pagina": 1, "registros_por_pagina": 5,
+                 "filtrar_apenas_omiepdv": "N",
+                 "listando": {"codigo": sku}}
+            )
+            produtos = resp2.get("produto_servico_cadastro", [])
+            if produtos:
+                cod = produtos[0].get("codigo_produto")
+        if cod:
+            cache_produtos[sku] = cod
+            print(f"Produto SKU {sku} -> ID ATIVA {cod}")
+        else:
+            print(f"Produto SKU {sku} nao encontrado na ATIVA. Resposta: {resp}")
+        return cod
+    # --- 4.5 Limpeza por item (resolve produto na ATIVA pelo SKU) ---
     if "det" in pedido and isinstance(pedido["det"], list):
         for item in pedido["det"]:
             ide = item.get("ide", {})
             ide.pop("codigo_item_pedido", None)
 
             prod = item.get("produto", {})
-            if prod.get("codigo") or prod.get("descricao"):
-                prod.pop("codigo_produto", None)
+            sku = prod.get("codigo")
+            if sku:
+                id_ativa = resolver_produto_ativa(sku)
+                if id_ativa:
+                    prod["codigo_produto"] = id_ativa
+                else:
+                    print(f"ATENCAO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA.")
             prod.pop("valor_total", None)
 
             inf = item.get("inf_adic", {})
             inf.pop("codigo_local_estoque", None)
             inf.pop("codigo_cenario_impostos_item", None)
-            # Categoria por item tambem vem da FRI; alinha com a categoria do pedido.
             if inf.get("codigo_categoria_item"):
                 inf["codigo_categoria_item"] = CATEGORIA_PADRAO
 

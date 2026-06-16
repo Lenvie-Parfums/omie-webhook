@@ -17,6 +17,9 @@ OMIE_PEDIDO_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 OMIE_CLIENTE_URL = "https://app.omie.com.br/api/v1/geral/clientes/"
 
 ETAPA_GATILHO = "80"
+# Etapa em que o pedido ENTRA na ATIVA. A 80 e do fluxo da FRI; no destino
+# o pedido deve entrar numa etapa inicial valida. Ajuste se necessario.
+ETAPA_ENTRADA_DESTINO = "10"
 
 
 # ==========================================================
@@ -154,6 +157,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
     cab.pop("numero_pedido", None)
     cab.pop("codigo_cenario_impostos", None)
     cab["codigo_pedido_integracao"] = codigo_integracao_destino
+    # A etapa "80" e do fluxo da FRI e nao existe como entrada na ATIVA.
+    # Entra sempre na etapa inicial padrao do destino (10 = registrado).
+    cab["etapa"] = ETAPA_ENTRADA_DESTINO
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)

@@ -156,7 +156,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
         return False
 
     cod_int = pedido["cabecalho"].get("codigo_pedido_integracao") or str(codigo_pedido_origem)
-    codigo_integracao_destino = f"{cod_int}-ATIVA"
+    # Limita o tamanho do codigo de integracao do pedido para evitar extrapolamento
+    codigo_integracao_destino = f"{cod_int}-ATV"[:30]
+    
     if pedido_ja_existe_na_ativa(codigo_integracao_destino):
         return True
 
@@ -193,10 +195,16 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if "frete" in pedido and isinstance(pedido["frete"], dict):
         pedido["frete"].pop("codigo_transportadora", None)
 
+    # LOOP DOS ITENS (Com geração de RG único e remoção do ID antigo)
     if "det" in pedido and isinstance(pedido["det"], list):
-        for item in pedido["det"]:
+        for index, item in enumerate(pedido["det"], start=1):
             ide = item.get("ide", {})
+            # Remove IDs de controle interno da base de origem
+            ide.pop("codigo_item", None)
             ide.pop("codigo_item_pedido", None)
+            
+            # GERA O "RG" OBRIGATÓRIO PARA A API DO OMIE
+            ide["codigo_item_integracao"] = f"{codigo_integracao_destino}-{index}"[:30]
 
             prod = item.get("produto", {})
             sku = prod.get("codigo")
@@ -204,7 +212,6 @@ def transferir_pedido_omie(codigo_pedido_origem):
                 id_ativa = obter_id_produto_ativa(sku)
                 if id_ativa:
                     prod["codigo_produto"] = id_ativa
-                    ide["codigo_item"] = id_ativa  # A CORREÇÃO FOI FEITA AQUI
                 else:
                     print(f"❌ ERRO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA. Abortando pedido.")
                     return False
@@ -225,7 +232,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
     )
 
     if "codigo_pedido" in res:
-        print(f"SUCESSO! Pedido na ATIVA. Novo ID: {res['codigo_pedido']}")
+        print(f"✅ SUCESSO! Pedido transferido para a ATIVA. Novo ID: {res['codigo_pedido']}")
         return True
 
     print(f"ERRO DO OMIE (ATIVA): {res}")

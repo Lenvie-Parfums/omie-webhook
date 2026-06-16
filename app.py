@@ -37,6 +37,8 @@ CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 # 6760726795 = "Itau Unibanco" (conta de teste). Ajuste para a conta de
 # recebimento correta definida pelo financeiro, se necessario.
 CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"))
+# Codigo de parcela/condicao de pagamento. "000" = a vista (universal).
+CODIGO_PARCELA_PADRAO = os.environ.get("CODIGO_PARCELA_PADRAO", "000")
 
 
 # ==========================================================
@@ -188,6 +190,13 @@ def transferir_pedido_omie(codigo_pedido_origem):
     # origem_pedido "ERP" da FRI nao e aceita na ATIVA. Como entra via API,
     # forcamos "API", que esta na lista de origens validas do destino.
     cab["origem_pedido"] = "API"
+    # codigo_parcela da FRI (ex: "S60") pode nao existir na ATIVA.
+    # Forca "000" (a vista), codigo universal. Ajuste se necessario.
+    cab["codigo_parcela"] = CODIGO_PARCELA_PADRAO
+    cab["qtde_parcelas"] = 1
+    # Remove a lista de parcelas da FRI (datas/valores) para nao conflitar
+    # com a parcela a vista forcada. A ATIVA gera a parcela conforme o codigo.
+    pedido.pop("lista_parcelas", None)
     # Transportadora tem ID interno na FRI que nao existe na ATIVA.
     # Removida no teste; definir depois no destino se necessario.
     cab.pop("codigo_transportadora", None)

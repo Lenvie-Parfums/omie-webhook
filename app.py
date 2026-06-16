@@ -20,6 +20,10 @@ ETAPA_GATILHO = "80"
 # Etapa em que o pedido ENTRA na ATIVA. A 80 e do fluxo da FRI; no destino
 # o pedido deve entrar numa etapa inicial valida. Ajuste se necessario.
 ETAPA_ENTRADA_DESTINO = "10"
+# Categoria (plano de contas) usada quando o pedido da FRI nao traz uma.
+# Formato Omie: "X.XX.XX". Veja as categorias validas da ATIVA acessando
+# a rota /categorias deste servico. Ajuste para a categoria de venda correta.
+CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.01")
 
 
 # ==========================================================
@@ -169,7 +173,14 @@ def transferir_pedido_omie(codigo_pedido_origem):
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
-        pedido["informacoes_adicionais"].pop("codigo_categoria", None)
+        # NAO removemos codigo_categoria: a ATIVA exige. Preservamos o da FRI;
+        # se vier vazio, aplicamos um padrao configuravel.
+        cat_atual = pedido["informacoes_adicionais"].get("codigo_categoria")
+        if not cat_atual:
+            pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
+    else:
+        # Garante o bloco com a categoria, caso a FRI nao envie informacoes_adicionais
+        pedido["informacoes_adicionais"] = {"codigo_categoria": CATEGORIA_PADRAO}
 
     # Transportadora tambem pode vir aninhada no bloco frete.
     if "frete" in pedido and isinstance(pedido["frete"], dict):
@@ -234,6 +245,25 @@ def receber_webhook():
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
     return jsonify({"status": "online"}), 200
+
+
+@app.route('/categorias', methods=['GET'])
+def listar_categorias():
+    # Lista as categorias (plano de contas) da ATIVA para voce escolher
+    # o codigo de venda correto e colocar em CATEGORIA_PADRAO.
+    url = "https://app.omie.com.br/api/v1/geral/categorias/"
+    resp = chamar_omie(
+        url, "ListarCategorias",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"pagina": 1, "registros_por_pagina": 500}
+    )
+    cats = resp.get("categoria_cadastro", [])
+    # Devolve so o essencial: codigo e descricao
+    enxuto = [
+        {"codigo": c.get("codigo"), "descricao": c.get("descricao")}
+        for c in cats
+    ]
+    return jsonify({"total": len(enxuto), "categorias": enxuto}), 200
 
 
 if __name__ == '__main__':

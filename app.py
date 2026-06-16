@@ -160,6 +160,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
     # A etapa "80" e do fluxo da FRI e nao existe como entrada na ATIVA.
     # Entra sempre na etapa inicial padrao do destino (10 = registrado).
     cab["etapa"] = ETAPA_ENTRADA_DESTINO
+    # origem_pedido "ERP" da FRI nao e aceita na ATIVA. Como entra via API,
+    # forcamos "API", que esta na lista de origens validas do destino.
+    cab["origem_pedido"] = "API"
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)

@@ -163,10 +163,17 @@ def transferir_pedido_omie(codigo_pedido_origem):
     # origem_pedido "ERP" da FRI nao e aceita na ATIVA. Como entra via API,
     # forcamos "API", que esta na lista de origens validas do destino.
     cab["origem_pedido"] = "API"
+    # Transportadora tem ID interno na FRI que nao existe na ATIVA.
+    # Removida no teste; definir depois no destino se necessario.
+    cab.pop("codigo_transportadora", None)
 
     if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
         pedido["informacoes_adicionais"].pop("codigo_categoria", None)
+
+    # Transportadora tambem pode vir aninhada no bloco frete.
+    if "frete" in pedido and isinstance(pedido["frete"], dict):
+        pedido["frete"].pop("codigo_transportadora", None)
 
     # --- 4.5 Limpeza por item (preserva SKU e descricao p/ o destino resolver) ---
     if "det" in pedido and isinstance(pedido["det"], list):

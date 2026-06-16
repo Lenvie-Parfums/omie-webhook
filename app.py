@@ -204,6 +204,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
                 id_ativa = obter_id_produto_ativa(sku)
                 if id_ativa:
                     prod["codigo_produto"] = id_ativa
+                    ide["codigo_item"] = id_ativa  # A CORREÇÃO FOI FEITA AQUI
                 else:
                     print(f"❌ ERRO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA. Abortando pedido.")
                     return False

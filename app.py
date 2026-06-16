@@ -232,7 +232,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
     )
 
     if "codigo_pedido" in res:
-        print(f"✅ SUCESSO! Pedido transferido para a ATIVA. Novo ID: {res['codigo_pedido']}")
+        print(f"✅ SUCESSO! Pedido transferido para a FILIADO ATACADO ES. Novo ID: {res['codigo_pedido']}")
         return True
 
     print(f"ERRO DO OMIE (ATIVA): {res}")

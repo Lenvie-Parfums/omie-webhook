@@ -205,7 +205,8 @@ def transferir_pedido_omie(codigo_pedido_origem):
                 if id_ativa:
                     prod["codigo_produto"] = id_ativa
                 else:
-                    print(f"ATENCAO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA.")
+                    print(f"❌ ERRO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA. Abortando pedido.")
+                    return False
             prod.pop("valor_total", None)
 
             inf = item.get("inf_adic", {})

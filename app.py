@@ -1,8 +1,18 @@
 import os
+import time
+import threading
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+# Controle de deduplicacao em memoria: evita reprocessar o mesmo pedido
+# em loop (o que dispara o bloqueio MISUSE_API_PROCESS da Omie).
+_pedidos_em_processamento = set()
+_pedidos_ultimo_processo = {}
+_lock = threading.Lock()
+# Tempo minimo (segundos) antes de aceitar reprocessar o mesmo pedido.
+COOLDOWN_PEDIDO = int(os.environ.get("COOLDOWN_PEDIDO", "300"))
 
 # ==========================================================
 # 1. CREDENCIAIS OMIE  (use variaveis de ambiente no Render)
@@ -44,6 +54,14 @@ def chamar_omie(url, call, app_key, app_secret, param):
     except Exception as e:
         print(f"Falha de rede em {call}: {e}")
         return {"faultstring": str(e)}
+
+    # Detecta bloqueio/abuso da API e sinaliza claramente no log.
+    fault = str(resp.get("faultstring", "")) if isinstance(resp, dict) else ""
+    if "MISUSE_API_PROCESS" in str(resp) or "API bloqueada" in fault:
+        print(f"!!! API OMIE BLOQUEADA em {call}. PARE os testes e aguarde. Resposta: {fault}")
+    elif "REDUNDANT" in str(resp):
+        print(f"Consumo redundante em {call}. Aguarde antes de repetir.")
+
     return resp
 
 
@@ -205,6 +223,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
             inf = item.get("inf_adic", {})
             inf.pop("codigo_local_estoque", None)
             inf.pop("codigo_cenario_impostos_item", None)
+            # Categoria por item tambem vem da FRI; alinha com a categoria do pedido.
+            if inf.get("codigo_categoria_item"):
+                inf["codigo_categoria_item"] = CATEGORIA_PADRAO
 
     # --- 4.6 Remove blocos read-only / calculados ---
     for chave in ["infoCadastro", "total_pedido", "departamentos"]:
@@ -239,8 +260,34 @@ def receber_webhook():
     etapa_atual = str(mensagem.get('etapa', ''))
 
     if etapa_atual == ETAPA_GATILHO:
-        print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual})...")
-        sucesso = transferir_pedido_omie(codigo_pedido)
+        # --- TRAVA ANTI-LOOP ---
+        # A Omie reenvia o webhook varias vezes. Sem controle, o mesmo pedido
+        # e reprocessado em loop e a API e bloqueada (MISUSE_API_PROCESS).
+        agora = time.time()
+        with _lock:
+            # Ja esta sendo processado neste exato momento? Ignora.
+            if codigo_pedido in _pedidos_em_processamento:
+                print(f"Pedido {codigo_pedido} ja em processamento. Ignorando reenvio.")
+                return jsonify({"status": "em_processamento"}), 200
+
+            # Foi processado ha pouco tempo? Respeita o cooldown.
+            ultimo = _pedidos_ultimo_processo.get(codigo_pedido, 0)
+            if agora - ultimo < COOLDOWN_PEDIDO:
+                restante = int(COOLDOWN_PEDIDO - (agora - ultimo))
+                print(f"Pedido {codigo_pedido} processado ha pouco. Cooldown {restante}s. Ignorando.")
+                return jsonify({"status": "cooldown"}), 200
+
+            # Libera o processamento e marca como em andamento.
+            _pedidos_em_processamento.add(codigo_pedido)
+            _pedidos_ultimo_processo[codigo_pedido] = agora
+
+        try:
+            print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual})...")
+            sucesso = transferir_pedido_omie(codigo_pedido)
+        finally:
+            with _lock:
+                _pedidos_em_processamento.discard(codigo_pedido)
+
         # SEMPRE 200: 500 faz a Omie reenfileirar o mesmo evento e travar a fila.
         return jsonify({"status": "transferido" if sucesso else "erro"}), 200
 

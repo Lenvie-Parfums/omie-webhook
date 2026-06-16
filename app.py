@@ -6,6 +6,17 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# Carrega o catalogo de produtos da ATIVA na primeira requisicao.
+# Funciona tanto com `python app.py` quanto com gunicorn.
+_startup_feito = False
+
+@app.before_request
+def startup():
+    global _startup_feito
+    if not _startup_feito:
+        _startup_feito = True
+        threading.Thread(target=carregar_catalogo_ativa, daemon=True).start()
+
 # Controle de deduplicacao em memoria: evita reprocessar o mesmo pedido
 # em loop (o que dispara o bloqueio MISUSE_API_PROCESS da Omie).
 _pedidos_em_processamento = set()
@@ -25,6 +36,7 @@ APP_SECRET_DESTINO = os.environ.get("APP_SECRET_DESTINO", "e3e98a53e601102596075
 
 OMIE_PEDIDO_URL = "https://app.omie.com.br/api/v1/produtos/pedido/"
 OMIE_CLIENTE_URL = "https://app.omie.com.br/api/v1/geral/clientes/"
+OMIE_PRODUTO_URL = "https://app.omie.com.br/api/v1/geral/produtos/"
 
 ETAPA_GATILHO = "80"
 # Etapa em que o pedido ENTRA na ATIVA. A 80 e do fluxo da FRI; no destino
@@ -42,8 +54,55 @@ CODIGO_PARCELA_PADRAO = os.environ.get("CODIGO_PARCELA_PADRAO", "000")
 
 
 # ==========================================================
-# HELPER GENERICO DE CHAMADA OMIE
+# CATALOGO DE PRODUTOS DA ATIVA
+# Carregado uma vez no startup: SKU (codigo) -> codigo_produto (ID numerico).
+# Evita chamadas API por item durante o pedido (que causam bloqueio da Omie).
 # ==========================================================
+_catalogo_ativa = {}   # {"104013120": 7204395361, ...}
+_catalogo_carregado = False
+
+
+def carregar_catalogo_ativa():
+    """Pagina todos os produtos da ATIVA e monta o dicionario SKU->ID."""
+    global _catalogo_ativa, _catalogo_carregado
+    catalogo = {}
+    pagina = 1
+    total_paginas = 1
+    print("Carregando catalogo de produtos da ATIVA...")
+    while pagina <= total_paginas:
+        resp = chamar_omie(
+            OMIE_PRODUTO_URL, "ListarProdutos",
+            APP_KEY_DESTINO, APP_SECRET_DESTINO,
+            {"pagina": pagina, "registros_por_pagina": 500,
+             "filtrar_apenas_omiepdv": "N",
+             "filtrar_apenas_marketplace": "N"}
+        )
+        if "faultstring" in resp:
+            print(f"Erro ao carregar catalogo (pag {pagina}): {resp['faultstring']}")
+            break
+        prods = resp.get("produto_servico_cadastro", [])
+        total_paginas = resp.get("total_de_paginas", 1)
+        for p in prods:
+            sku = str(p.get("codigo", "")).strip()
+            cod_id = p.get("codigo_produto")
+            if sku and cod_id:
+                catalogo[sku] = cod_id
+        print(f"  Pagina {pagina}/{total_paginas} — {len(prods)} produtos")
+        pagina += 1
+        if pagina <= total_paginas:
+            time.sleep(0.5)   # respeita rate limit entre paginas
+    _catalogo_ativa = catalogo
+    _catalogo_carregado = True
+    print(f"Catalogo carregado: {len(catalogo)} produtos na ATIVA.")
+
+
+def obter_id_produto_ativa(sku):
+    """Retorna o codigo_produto da ATIVA para um SKU, ou None se nao existir."""
+    sku = str(sku).strip()
+    cod = _catalogo_ativa.get(sku)
+    if not cod:
+        print(f"SKU {sku} nao encontrado no catalogo da ATIVA.")
+    return cod
 def chamar_omie(url, call, app_key, app_secret, param):
     payload = {
         "call": call,
@@ -221,41 +280,10 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if "frete" in pedido and isinstance(pedido["frete"], dict):
         pedido["frete"].pop("codigo_transportadora", None)
 
-    # --- 4.4b Cache de produtos da ATIVA (SKU -> codigo_produto) ---
-    # A Omie exige codigo_produto ou codigo_produto_integracao. O ID da FRI
-    # nao vale na ATIVA, entao consultamos o produto la pelo SKU.
-    cache_produtos = {}
-
+    # --- 4.4b Resolve produto na ATIVA via catalogo pre-carregado ---
+    # Nao faz chamadas API por item (evita bloqueio em pedidos grandes).
     def resolver_produto_ativa(sku):
-        if sku in cache_produtos:
-            return cache_produtos[sku]
-        # Tenta buscar pelo codigo (SKU) na ATIVA
-        resp = chamar_omie(
-            "https://app.omie.com.br/api/v1/geral/produtos/",
-            "ConsultarProduto",
-            APP_KEY_DESTINO, APP_SECRET_DESTINO,
-            {"codigo_produto_integracao": sku}
-        )
-        cod = resp.get("codigo_produto")
-        # Se nao achou por integracao, tenta pelo codigo interno via ListarProdutos
-        if not cod:
-            resp2 = chamar_omie(
-                "https://app.omie.com.br/api/v1/geral/produtos/",
-                "ListarProdutos",
-                APP_KEY_DESTINO, APP_SECRET_DESTINO,
-                {"pagina": 1, "registros_por_pagina": 5,
-                 "filtrar_apenas_omiepdv": "N",
-                 "listando": {"codigo": sku}}
-            )
-            produtos = resp2.get("produto_servico_cadastro", [])
-            if produtos:
-                cod = produtos[0].get("codigo_produto")
-        if cod:
-            cache_produtos[sku] = cod
-            print(f"Produto SKU {sku} -> ID ATIVA {cod}")
-        else:
-            print(f"Produto SKU {sku} nao encontrado na ATIVA. Resposta: {resp}")
-        return cod
+        return obter_id_produto_ativa(sku)
     # --- 4.5 Limpeza por item (resolve produto na ATIVA pelo SKU) ---
     if "det" in pedido and isinstance(pedido["det"], list):
         for item in pedido["det"]:
@@ -370,7 +398,20 @@ def listar_contas():
 
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
-    return jsonify({"status": "online"}), 200
+    return jsonify({
+        "status": "online",
+        "catalogo_produtos": len(_catalogo_ativa),
+        "catalogo_carregado": _catalogo_carregado
+    }), 200
+
+
+@app.route('/recarregar-catalogo', methods=['POST'])
+def recarregar_catalogo():
+    """Recarrega o catalogo de produtos da ATIVA manualmente."""
+    def _bg():
+        carregar_catalogo_ativa()
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"status": "recarregando", "msg": "Catalogo sendo recarregado em background."}), 200
 
 
 @app.route('/categorias', methods=['GET'])
@@ -393,5 +434,6 @@ def listar_categorias():
 
 
 if __name__ == '__main__':
+    carregar_catalogo_ativa()
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)

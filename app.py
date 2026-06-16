@@ -24,8 +24,9 @@ ETAPA_ENTRADA_DESTINO = "10"
 # 1.01.02 = "Venda Atacado - Representantes" (fluxo dos representantes).
 CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 # Conta corrente (ID numerico) da ATIVA para lancar o pedido.
-# Descubra o ID valido acessando a rota /contas deste servico e ajuste aqui.
-CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "0"))
+# 6760726795 = "Itau Unibanco" (conta de teste). Ajuste para a conta de
+# recebimento correta definida pelo financeiro, se necessario.
+CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"))
 
 
 # ==========================================================

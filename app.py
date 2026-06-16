@@ -4,11 +4,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ==========================================
-# 1. CREDENCIAIS OMIE
-#    Use variaveis de ambiente no Render.
-#    Os valores apos a virgula sao fallback local.
-# ==========================================
+# ==========================================================
+# 1. CREDENCIAIS OMIE  (use variaveis de ambiente no Render)
+# ==========================================================
 APP_KEY_ORIGEM = os.environ.get("APP_KEY_ORIGEM", "1724630275368")
 APP_SECRET_ORIGEM = os.environ.get("APP_SECRET_ORIGEM", "549a26b527f429912abf81f18570030e")
 
@@ -21,172 +19,186 @@ OMIE_CLIENTE_URL = "https://app.omie.com.br/api/v1/geral/clientes/"
 ETAPA_GATILHO = "80"
 
 
-# ==========================================
-# 2. TRADUTOR DE CLIENTE (ORIGEM -> ATIVA por CNPJ/CPF)
-# ==========================================
-def obter_cliente_destino(codigo_cliente_origem):
-    # --- Pega o CNPJ/CPF na ORIGEM ---
-    payload_origem = {
-        "call": "ConsultarCliente",
-        "app_key": APP_KEY_ORIGEM,
-        "app_secret": APP_SECRET_ORIGEM,
-        "param": [{"codigo_cliente_omie": codigo_cliente_origem}]
+# ==========================================================
+# HELPER GENERICO DE CHAMADA OMIE
+# ==========================================================
+def chamar_omie(url, call, app_key, app_secret, param):
+    payload = {
+        "call": call,
+        "app_key": app_key,
+        "app_secret": app_secret,
+        "param": [param]
     }
-    cli_origem = requests.post(OMIE_CLIENTE_URL, json=payload_origem).json()
-    print(f"🔎 RETORNO ConsultarCliente ORIGEM: {cli_origem}")
+    try:
+        resp = requests.post(url, json=payload, timeout=60).json()
+    except Exception as e:
+        print(f"Falha de rede em {call}: {e}")
+        return {"faultstring": str(e)}
+    return resp
 
-    cnpj_cpf = cli_origem.get("cnpj_cpf")
-    print(f"🔎 CNPJ/CPF EXTRAIDO: {cnpj_cpf}")
 
+# ==========================================================
+# 2. ESPELHAR O CLIENTE (ORIGEM -> ATIVA)
+#    Puxa o cadastro completo na FRI e recria/atualiza na ATIVA
+#    via UpsertCliente (chave = codigo_cliente_integracao).
+#    Retorna o codigo_cliente_omie do DESTINO.
+# ==========================================================
+def espelhar_cliente_destino(codigo_cliente_origem):
+    # --- 2.1 Cadastro completo na ORIGEM ---
+    cli = chamar_omie(
+        OMIE_CLIENTE_URL, "ConsultarCliente",
+        APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+        {"codigo_cliente_omie": codigo_cliente_origem}
+    )
+    print(f"ConsultarCliente ORIGEM: {cli}")
+
+    cnpj_cpf = cli.get("cnpj_cpf")
     if not cnpj_cpf:
-        print("⚠️ CNPJ/CPF veio vazio do ConsultarCliente da origem.")
+        print("Cliente da origem sem CNPJ/CPF. Abortando.")
         return None
 
-    # Normaliza: remove pontuacao para casar com qualquer formato gravado na ATIVA
+    # Codigo de integracao deterministico = derivado do CNPJ.
+    # Garante idempotencia: o mesmo cliente sempre cai no mesmo registro.
     cnpj_limpo = "".join(filter(str.isalnum, cnpj_cpf))
+    cod_int_cliente = f"FRI-{cnpj_limpo}"
 
-    # --- Procura o mesmo CNPJ/CPF na ATIVA ---
-    payload_destino = {
-        "call": "ListarClientes",
-        "app_key": APP_KEY_DESTINO,
-        "app_secret": APP_SECRET_DESTINO,
-        "param": [{
-            "pagina": 1,
-            "registros_por_pagina": 10,
-            "clientesFiltro": {"cnpj_cpf": cnpj_limpo}
-        }]
-    }
-    busca_destino = requests.post(OMIE_CLIENTE_URL, json=payload_destino).json()
-    print(f"🔎 RETORNO ListarClientes ATIVA: {busca_destino}")
+    # --- 2.2 Monta o cadastro para o DESTINO, copiando os campos fiscais ---
+    campos = [
+        "razao_social", "nome_fantasia", "cnpj_cpf", "email",
+        "telefone1_ddd", "telefone1_numero",
+        "endereco", "endereco_numero", "complemento", "bairro",
+        "cidade", "estado", "cep", "cidade_ibge", "codigo_pais",
+        "inscricao_estadual", "inscricao_municipal",
+        "pessoa_fisica", "optante_simples_nacional",
+        "contribuinte", "produtor_rural",
+    ]
+    upsert = {"codigo_cliente_integracao": cod_int_cliente}
+    for c in campos:
+        if cli.get(c) not in (None, ""):
+            upsert[c] = cli[c]
 
-    clientes = busca_destino.get("clientes_cadastro", [])
-    if clientes:
-        id_destino = clientes[0]["codigo_cliente_omie"]
-        print(f"✅ Cliente encontrado na ATIVA. ID destino: {id_destino}")
+    # Trava da Omie: nao fatura cliente cujo nome comece com "Cliente".
+    if str(upsert.get("razao_social", "")).strip().lower().startswith("cliente"):
+        print("AVISO: razao social comeca com 'Cliente' - Omie bloqueia faturamento.")
+
+    # --- 2.3 Upsert no DESTINO (cria se nao existe, atualiza se existe) ---
+    res = chamar_omie(
+        OMIE_CLIENTE_URL, "UpsertCliente",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO, upsert
+    )
+    print(f"UpsertCliente ATIVA: {res}")
+
+    id_destino = res.get("codigo_cliente_omie")
+    if id_destino:
+        print(f"Cliente espelhado na ATIVA. ID destino: {id_destino}")
         return id_destino
 
-    print("❌ Cliente nao encontrado na ATIVA com esse CNPJ/CPF.")
+    print(f"UpsertCliente nao retornou ID. Resposta: {res}")
     return None
 
 
-# ==========================================
-# 3. CHECAGEM DE IDEMPOTENCIA
-#    Evita duplicar pedido se a Omie reenviar o webhook.
-# ==========================================
+# ==========================================================
+# 3. IDEMPOTENCIA DO PEDIDO
+# ==========================================================
 def pedido_ja_existe_na_ativa(codigo_pedido_integracao):
-    payload = {
-        "call": "ConsultarPedido",
-        "app_key": APP_KEY_DESTINO,
-        "app_secret": APP_SECRET_DESTINO,
-        "param": [{"codigo_pedido_integracao": codigo_pedido_integracao}]
-    }
-    resp = requests.post(OMIE_PEDIDO_URL, json=payload).json()
-    # Se achou o pedido, vem 'pedido_venda_produto'; se nao, vem faultstring
+    resp = chamar_omie(
+        OMIE_PEDIDO_URL, "ConsultarPedido",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"codigo_pedido_integracao": codigo_pedido_integracao}
+    )
     if "pedido_venda_produto" in resp:
-        print(f"♻️ Pedido {codigo_pedido_integracao} JA existe na ATIVA. Ignorando.")
+        print(f"Pedido {codigo_pedido_integracao} JA existe na ATIVA. Ignorando.")
         return True
     return False
 
 
-# ==========================================
-# 4. FUNCAO DE TRANSFERENCIA
-# ==========================================
+# ==========================================================
+# 4. TRANSFERENCIA DO PEDIDO (FRI -> ATIVA)
+# ==========================================================
 def transferir_pedido_omie(codigo_pedido_origem):
-    # --- 1. Consulta na ORIGEM ---
-    payload_consulta = {
-        "call": "ConsultarPedido",
-        "app_key": APP_KEY_ORIGEM,
-        "app_secret": APP_SECRET_ORIGEM,
-        "param": [{"codigo_pedido": codigo_pedido_origem}]
-    }
-    pedido_origem_bruto = requests.post(OMIE_PEDIDO_URL, json=payload_consulta).json()
+    # --- 4.1 Consulta na ORIGEM ---
+    bruto = chamar_omie(
+        OMIE_PEDIDO_URL, "ConsultarPedido",
+        APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+        {"codigo_pedido": codigo_pedido_origem}
+    )
+    print(f"ConsultarPedido ORIGEM: {bruto}")
 
-    if "faultstring" in pedido_origem_bruto:
-        print(f"❌ Erro na origem: {pedido_origem_bruto['faultstring']}")
+    if "faultstring" in bruto:
+        print(f"Erro na origem: {bruto['faultstring']}")
         return False
 
-    pedido = pedido_origem_bruto.get("pedido_venda_produto", pedido_origem_bruto)
-
+    pedido = bruto.get("pedido_venda_produto", bruto)
     if "cabecalho" not in pedido:
-        print("❌ ERRO: pedido desempacotado nao possui [cabecalho].")
+        print("Pedido sem [cabecalho].")
         return False
 
-    # --- 2. Idempotencia: monta o codigo de integracao e checa se ja existe ---
-    cod_int = pedido["cabecalho"].get("codigo_pedido_integracao", str(codigo_pedido_origem))
+    # --- 4.2 Idempotencia ---
+    cod_int = pedido["cabecalho"].get("codigo_pedido_integracao") or str(codigo_pedido_origem)
     codigo_integracao_destino = f"{cod_int}-ATIVA"
-
     if pedido_ja_existe_na_ativa(codigo_integracao_destino):
-        return True  # ja foi transferido antes; trata como sucesso
+        return True
 
-    # --- 3. Traduzir o CLIENTE (origem -> ATIVA) ---
-    id_origem = pedido["cabecalho"].get("codigo_cliente")
-    print(f"🔍 Buscando CNPJ do cliente origem {id_origem}...")
-
-    id_destino = obter_cliente_destino(id_origem)
-    if not id_destino:
-        print("❌ ERRO: Cliente nao encontrado na ATIVA (CNPJ nao cadastrado).")
+    # --- 4.3 Espelhar o cliente (cria/atualiza na ATIVA com dados fiscais) ---
+    id_origem_cliente = pedido["cabecalho"].get("codigo_cliente")
+    print(f"Espelhando cliente origem {id_origem_cliente}...")
+    id_destino_cliente = espelhar_cliente_destino(id_origem_cliente)
+    if not id_destino_cliente:
+        print("Nao foi possivel espelhar o cliente na ATIVA.")
         return False
+    pedido["cabecalho"]["codigo_cliente"] = id_destino_cliente
 
-    pedido["cabecalho"]["codigo_cliente"] = id_destino
-    print(f"✅ Cliente traduzido para o ID {id_destino} da ATIVA.")
+    # --- 4.4 Limpeza de IDs internos da ORIGEM no cabecalho ---
+    cab = pedido["cabecalho"]
+    cab.pop("codigo_pedido", None)
+    cab.pop("numero_pedido", None)
+    cab.pop("codigo_cenario_impostos", None)
+    cab["codigo_pedido_integracao"] = codigo_integracao_destino
 
-    # --- 4. Limpeza de IDs internos da ORIGEM ---
-    pedido["cabecalho"].pop("codigo_pedido", None)
-    pedido["cabecalho"].pop("numero_pedido", None)
-    pedido["cabecalho"].pop("codigo_cenario_impostos", None)
-    pedido["cabecalho"]["codigo_pedido_integracao"] = codigo_integracao_destino
-
-    if "informacoes_adicionais" in pedido:
+    if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
         pedido["informacoes_adicionais"].pop("codigo_conta_corrente", None)
+        pedido["informacoes_adicionais"].pop("codigo_categoria", None)
 
-    # --- 5. Limpeza por item (det) ---
-    #    Produto: removemos o codigo_produto numerico da origem e
-    #    mandamos pelo codigo (SKU), que e igual nos dois CNPJs.
-    if "det" in pedido:
+    # --- 4.5 Limpeza por item (preserva SKU e descricao p/ o destino resolver) ---
+    if "det" in pedido and isinstance(pedido["det"], list):
         for item in pedido["det"]:
             ide = item.get("ide", {})
             ide.pop("codigo_item_pedido", None)
 
             prod = item.get("produto", {})
-            # Garante que a ATIVA resolva o produto pelo SKU, nao pelo ID interno
-            if prod.get("codigo"):
+            if prod.get("codigo") or prod.get("descricao"):
                 prod.pop("codigo_produto", None)
-            # Remove valores calculados que a Omie rejeita na inclusao
             prod.pop("valor_total", None)
 
-            inf_adic = item.get("inf_adic", {})
-            inf_adic.pop("codigo_local_estoque", None)
-            inf_adic.pop("codigo_cenario_impostos_item", None)
+            inf = item.get("inf_adic", {})
+            inf.pop("codigo_local_estoque", None)
+            inf.pop("codigo_cenario_impostos_item", None)
 
-    # --- 6. Remove blocos read-only / calculados do pedido ---
-    for chave in ["infoCadastro", "departamentos", "observacoes", "total_pedido"]:
+    # --- 4.6 Remove blocos read-only / calculados ---
+    for chave in ["infoCadastro", "total_pedido", "departamentos"]:
         pedido.pop(chave, None)
 
-    # --- 7. Inclusao na ATIVA ---
-    payload_inclusao = {
-        "call": "IncluirPedido",
-        "app_key": APP_KEY_DESTINO,
-        "app_secret": APP_SECRET_DESTINO,
-        "param": [pedido]
-    }
-    resultado = requests.post(OMIE_PEDIDO_URL, json=payload_inclusao).json()
+    # --- 4.7 Inclusao na ATIVA ---
+    res = chamar_omie(
+        OMIE_PEDIDO_URL, "IncluirPedido",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido
+    )
 
-    if "codigo_pedido" in resultado:
-        print(f"✅ SUCESSO! Pedido transferido. Novo ID ATIVA: {resultado['codigo_pedido']}")
+    if "codigo_pedido" in res:
+        print(f"SUCESSO! Pedido na ATIVA. Novo ID: {res['codigo_pedido']}")
         return True
-    else:
-        print(f"❌ ERRO DO OMIE (ATIVA): {resultado}")
-        return False
+
+    print(f"ERRO DO OMIE (ATIVA): {res}")
+    return False
 
 
-# ==========================================
-# 5. ROTA DO WEBHOOK
-# ==========================================
+# ==========================================================
+# 5. WEBHOOK
+# ==========================================================
 @app.route('/webhook/omie', methods=['POST'])
 def receber_webhook():
     payload = request.json
 
-    # Ping de validacao do Omie
     if payload and payload.get('ping'):
         return jsonify({"status": "ok"}), 200
 
@@ -195,16 +207,14 @@ def receber_webhook():
     etapa_atual = str(mensagem.get('etapa', ''))
 
     if etapa_atual == ETAPA_GATILHO:
-        print(f"⏳ Tentando transferir pedido {codigo_pedido} (etapa {etapa_atual})...")
+        print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual})...")
         sucesso = transferir_pedido_omie(codigo_pedido)
-        # SEMPRE 200: se devolver 500, a Omie reenfileira o MESMO pedido
-        # infinitamente e trava a fila para os pedidos seguintes.
+        # SEMPRE 200: 500 faz a Omie reenfileirar o mesmo evento e travar a fila.
         return jsonify({"status": "transferido" if sucesso else "erro"}), 200
 
     return jsonify({"status": "ignorado"}), 200
 
 
-# Healthcheck simples para o Render nao dar 404 na raiz
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
     return jsonify({"status": "online"}), 200

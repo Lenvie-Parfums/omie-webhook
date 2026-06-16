@@ -108,4 +108,215 @@ def espelhar_cliente_destino(codigo_cliente_origem):
 
 def obter_id_produto_ativa(sku):
     """Busca cirurgicamente um produto na ATIVA pelo seu SKU (codigo texto)."""
-    sku_str = str(sku).
+    sku_str = str(sku).strip()
+    resp = chamar_omie(
+        OMIE_PRODUTO_URL, "ConsultarProduto",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"codigo": sku_str}
+    )
+    cod_id = resp.get("codigo_produto")
+    if not cod_id:
+        print(f"SKU {sku_str} nao encontrado diretamente na ATIVA.")
+    return cod_id
+
+
+# ==========================================================
+# 3. IDEMPOTENCIA DO PEDIDO
+# ==========================================================
+def pedido_ja_existe_na_ativa(codigo_pedido_integracao):
+    resp = chamar_omie(
+        OMIE_PEDIDO_URL, "ConsultarPedido",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"codigo_pedido_integracao": codigo_pedido_integracao}
+    )
+    if "pedido_venda_produto" in resp:
+        print(f"Pedido {codigo_pedido_integracao} JA existe na ATIVA. Ignorando.")
+        return True
+    return False
+
+
+# ==========================================================
+# 4. TRANSFERENCIA DO PEDIDO (FRI -> ATIVA)
+# ==========================================================
+def transferir_pedido_omie(codigo_pedido_origem):
+    bruto = chamar_omie(
+        OMIE_PEDIDO_URL, "ConsultarPedido",
+        APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+        {"codigo_pedido": codigo_pedido_origem}
+    )
+    print(f"ConsultarPedido ORIGEM: {bruto}")
+
+    if "faultstring" in bruto:
+        print(f"Erro na origem: {bruto['faultstring']}")
+        return False
+
+    pedido = bruto.get("pedido_venda_produto", bruto)
+    if "cabecalho" not in pedido:
+        print("Pedido sem [cabecalho].")
+        return False
+
+    cod_int = pedido["cabecalho"].get("codigo_pedido_integracao") or str(codigo_pedido_origem)
+    codigo_integracao_destino = f"{cod_int}-ATIVA"
+    if pedido_ja_existe_na_ativa(codigo_integracao_destino):
+        return True
+
+    id_origem_cliente = pedido["cabecalho"].get("codigo_cliente")
+    print(f"Espelhando cliente origem {id_origem_cliente}...")
+    id_destino_cliente = espelhar_cliente_destino(id_origem_cliente)
+    if not id_destino_cliente:
+        print("Nao foi possivel espelhar o cliente na ATIVA.")
+        return False
+    pedido["cabecalho"]["codigo_cliente"] = id_destino_cliente
+
+    cab = pedido["cabecalho"]
+    cab.pop("codigo_pedido", None)
+    cab.pop("numero_pedido", None)
+    cab.pop("codigo_cenario_impostos", None)
+    cab["codigo_pedido_integracao"] = codigo_integracao_destino
+    cab["etapa"] = ETAPA_ENTRADA_DESTINO
+    cab["origem_pedido"] = "API"
+    cab["codigo_parcela"] = CODIGO_PARCELA_PADRAO
+    cab["qtde_parcelas"] = 1
+    pedido.pop("lista_parcelas", None)
+    cab.pop("codigo_transportadora", None)
+
+    if "informacoes_adicionais" in pedido and isinstance(pedido["informacoes_adicionais"], dict):
+        pedido["informacoes_adicionais"]["codigo_categoria"] = CATEGORIA_PADRAO
+        pedido["informacoes_adicionais"]["codigo_conta_corrente"] = CONTA_CORRENTE_PADRAO
+        pedido["informacoes_adicionais"].pop("codVend", None)
+    else:
+        pedido["informacoes_adicionais"] = {
+            "codigo_categoria": CATEGORIA_PADRAO,
+            "codigo_conta_corrente": CONTA_CORRENTE_PADRAO,
+        }
+
+    if "frete" in pedido and isinstance(pedido["frete"], dict):
+        pedido["frete"].pop("codigo_transportadora", None)
+
+    if "det" in pedido and isinstance(pedido["det"], list):
+        for item in pedido["det"]:
+            ide = item.get("ide", {})
+            ide.pop("codigo_item_pedido", None)
+
+            prod = item.get("produto", {})
+            sku = prod.get("codigo")
+            if sku:
+                id_ativa = obter_id_produto_ativa(sku)
+                if id_ativa:
+                    prod["codigo_produto"] = id_ativa
+                else:
+                    print(f"ATENCAO: SKU {sku} ({prod.get('descricao')}) nao cadastrado na ATIVA.")
+            prod.pop("valor_total", None)
+
+            inf = item.get("inf_adic", {})
+            inf.pop("codigo_local_estoque", None)
+            inf.pop("codigo_cenario_impostos_item", None)
+            if inf.get("codigo_categoria_item"):
+                inf["codigo_categoria_item"] = CATEGORIA_PADRAO
+
+    for chave in ["infoCadastro", "total_pedido", "departamentos"]:
+        pedido.pop(chave, None)
+
+    res = chamar_omie(
+        OMIE_PEDIDO_URL, "IncluirPedido",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido
+    )
+
+    if "codigo_pedido" in res:
+        print(f"SUCESSO! Pedido na ATIVA. Novo ID: {res['codigo_pedido']}")
+        return True
+
+    print(f"ERRO DO OMIE (ATIVA): {res}")
+    return False
+
+
+# ==========================================================
+# 5. WEBHOOK
+# ==========================================================
+@app.route('/webhook/omie', methods=['POST'])
+def receber_webhook():
+    payload = request.json
+
+    if payload and payload.get('ping'):
+        return jsonify({"status": "ok"}), 200
+
+    mensagem = payload.get('event', {}) if payload else {}
+    codigo_pedido = mensagem.get('idPedido')
+    etapa_atual = str(mensagem.get('etapa', ''))
+
+    if etapa_atual == ETAPA_GATILHO:
+        agora = time.time()
+        with _lock:
+            if codigo_pedido in _pedidos_em_processamento:
+                print(f"Pedido {codigo_pedido} ja em processamento. Ignorando reenvio.")
+                return jsonify({"status": "em_processamento"}), 200
+
+            ultimo = _pedidos_ultimo_processo.get(codigo_pedido, 0)
+            if agora - ultimo < COOLDOWN_PEDIDO:
+                restante = int(COOLDOWN_PEDIDO - (agora - ultimo))
+                print(f"Pedido {codigo_pedido} processado ha pouco. Cooldown {restante}s. Ignorando.")
+                return jsonify({"status": "cooldown"}), 200
+
+            _pedidos_em_processamento.add(codigo_pedido)
+            _pedidos_ultimo_processo[codigo_pedido] = agora
+
+        try:
+            print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual})...")
+            sucesso = transferir_pedido_omie(codigo_pedido)
+        finally:
+            with _lock:
+                _pedidos_em_processamento.discard(codigo_pedido)
+
+        return jsonify({"status": "transferido" if sucesso else "erro"}), 200
+
+    return jsonify({"status": "ignorado"}), 200
+
+
+@app.route('/contas', methods=['GET'])
+def listar_contas():
+    url = "https://app.omie.com.br/api/v1/geral/contacorrente/"
+    resp = chamar_omie(
+        url, "ListarContasCorrentes",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"pagina": 1, "registros_por_pagina": 100}
+    )
+    contas = resp.get("ListarContasCorrentes", resp.get("conta_corrente_lista", []))
+    enxuto = [
+        {
+            "nCodCC": c.get("nCodCC"),
+            "descricao": c.get("descricao"),
+            "tipo": c.get("tipo_conta_corrente"),
+        }
+        for c in contas
+    ]
+    return jsonify({"raw": resp if not enxuto else None,
+                    "total": len(enxuto), "contas": enxuto}), 200
+
+
+@app.route('/', methods=['GET', 'HEAD'])
+def home():
+    return jsonify({
+        "status": "online",
+        "modo_leitura": "sob_demanda"
+    }), 200
+
+
+@app.route('/categorias', methods=['GET'])
+def listar_categorias():
+    url = "https://app.omie.com.br/api/v1/geral/categorias/"
+    resp = chamar_omie(
+        url, "ListarCategorias",
+        APP_KEY_DESTINO, APP_SECRET_DESTINO,
+        {"pagina": 1, "registros_por_pagina": 500}
+    )
+    cats = resp.get("categoria_cadastro", [])
+    enxuto = [
+        {"codigo": c.get("codigo"), "descricao": c.get("descricao")}
+        for c in cats
+    ]
+    return jsonify({"total": len(enxuto), "categorias": enxuto}), 200
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)

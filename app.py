@@ -15,7 +15,10 @@ def startup():
     global _startup_feito
     if not _startup_feito:
         _startup_feito = True
-        threading.Thread(target=carregar_catalogo_ativa, daemon=True).start()
+        # Thread nao-daemon: nao e morta no shutdown, termina sozinha
+        t = threading.Thread(target=carregar_catalogo_ativa)
+        t.daemon = False
+        t.start()
 
 # Controle de deduplicacao em memoria: evita reprocessar o mesmo pedido
 # em loop (o que dispara o bloqueio MISUSE_API_PROCESS da Omie).
@@ -366,12 +369,21 @@ def receber_webhook():
     if payload and payload.get('ping'):
         return jsonify({"status": "ok"}), 200
 
+    # Se o catalogo ainda nao terminou de carregar, responde 200 sem processar.
+    # A Omie vai reenviar o evento e na proxima tentativa o catalogo ja estara pronto.
+    if not _catalogo_carregado:
+        print("Catalogo ainda carregando. Webhook adiado.")
+        return jsonify({"status": "aguardando_catalogo"}), 200
+
     mensagem = payload.get('event', {}) if payload else {}
     print(f"PAYLOAD RECEBIDO: {payload}")
+    topic = str(payload.get('topic', '')).lower() if payload else ''
     codigo_pedido = mensagem.get('idPedido') or mensagem.get('codigo_pedido')
     etapa_atual = str(mensagem.get('etapa', ''))
 
-    if etapa_atual == ETAPA_GATILHO:
+    # Processa se: etapa gatilho (ex: 10) OU topico de inclusao de pedido
+    eh_inclusao = 'incluido' in topic or 'incluida' in topic
+    if etapa_atual == ETAPA_GATILHO or eh_inclusao:
         # --- TRAVA ANTI-LOOP ---
         # A Omie reenvia o webhook varias vezes. Sem controle, o mesmo pedido
         # e reprocessado em loop e a API e bloqueada (MISUSE_API_PROCESS).

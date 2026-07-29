@@ -244,6 +244,11 @@ def transferir_pedido_omie(codigo_pedido_origem):
         print("Pedido sem [cabecalho].")
         return False
 
+    # Pedido sem itens nao pode ser incluido na ATIVA
+    if not pedido.get("det"):
+        print(f"Pedido {codigo_pedido_origem} sem itens [det]. Ignorando.")
+        return True
+
     # --- 4.2 Idempotencia ---
     cod_int = pedido["cabecalho"].get("codigo_pedido_integracao") or str(codigo_pedido_origem)
     codigo_integracao_destino = f"{cod_int}-ATIVA"

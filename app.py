@@ -73,15 +73,21 @@ def carregar_catalogo_ativa():
     total_paginas = 1
     print("Carregando catalogo de produtos da ATIVA...")
     while pagina <= total_paginas:
-        resp = chamar_omie(
-            OMIE_PRODUTO_URL, "ListarProdutos",
-            APP_KEY_DESTINO, APP_SECRET_DESTINO,
-            {"pagina": pagina, "registros_por_pagina": 500,
-             "filtrar_apenas_omiepdv": "N",
-             "filtrar_apenas_marketplace": "N"}
-        )
-        if "faultstring" in resp:
-            print(f"Erro ao carregar catalogo (pag {pagina}): {resp['faultstring']}")
+        # Tenta ate 3 vezes por pagina em caso de falha de rede
+        for tentativa in range(3):
+            resp = chamar_omie(
+                OMIE_PRODUTO_URL, "ListarProdutos",
+                APP_KEY_DESTINO, APP_SECRET_DESTINO,
+                {"pagina": pagina, "registros_por_pagina": 500,
+                 "filtrar_apenas_omiepdv": "N",
+                 "filtrar_apenas_marketplace": "N"}
+            )
+            if "faultstring" not in resp:
+                break
+            print(f"  Tentativa {tentativa+1} falhou (pag {pagina}): {resp['faultstring']}")
+            time.sleep(3)
+        else:
+            print(f"Erro ao carregar catalogo (pag {pagina}): {resp.get('faultstring')}")
             break
         prods = resp.get("produto_servico_cadastro", [])
         total_paginas = resp.get("total_de_paginas", 1)
@@ -97,6 +103,14 @@ def carregar_catalogo_ativa():
     _catalogo_ativa = catalogo
     _catalogo_carregado = True
     print(f"Catalogo carregado: {len(catalogo)} produtos na ATIVA.")
+
+
+def _loop_recarregamento_catalogo():
+    """Recarrega o catalogo automaticamente a cada 6 horas."""
+    while True:
+        time.sleep(6 * 3600)
+        print("Recarregando catalogo periodicamente...")
+        carregar_catalogo_ativa()
 
 
 def obter_id_produto_ativa(sku):
@@ -353,7 +367,8 @@ def receber_webhook():
         return jsonify({"status": "ok"}), 200
 
     mensagem = payload.get('event', {}) if payload else {}
-    codigo_pedido = mensagem.get('idPedido')
+    print(f"PAYLOAD RECEBIDO: {payload}")
+    codigo_pedido = mensagem.get('idPedido') or mensagem.get('codigo_pedido')
     etapa_atual = str(mensagem.get('etapa', ''))
 
     if etapa_atual == ETAPA_GATILHO:

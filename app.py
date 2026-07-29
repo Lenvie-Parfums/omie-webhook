@@ -39,7 +39,7 @@ OMIE_CLIENTE_URL = "https://app.omie.com.br/api/v1/geral/clientes/"
 OMIE_PRODUTO_URL = "https://app.omie.com.br/api/v1/geral/produtos/"
 
 ETAPA_GATILHO = "10"
-# Etapa em que o pedido ENTRA na ATIVA. A 10 e do fluxo da FRI; no destino
+# Etapa em que o pedido ENTRA na ATIVA. A 80 e do fluxo da FRI; no destino
 # o pedido deve entrar numa etapa inicial valida. Ajuste se necessario.
 ETAPA_ENTRADA_DESTINO = "10"
 # Categoria (plano de contas) usada quando o pedido da FRI nao traz uma.
@@ -231,16 +231,10 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if pedido_ja_existe_na_ativa(codigo_integracao_destino):
         return True
 
-    # --- 4.3 Espelhar o cliente (cria/atualiza na ATIVA com dados fiscais) ---
+    # --- 4.3 Filtro por estado — roda ANTES de qualquer chamada API ---
+    # Consulta o estado do cliente na origem e ignora se nao for ES/MG.
+    # Evita chamadas desnecessarias para pedidos de outros estados.
     id_origem_cliente = pedido["cabecalho"].get("codigo_cliente")
-    print(f"Espelhando cliente origem {id_origem_cliente}...")
-    id_destino_cliente = espelhar_cliente_destino(id_origem_cliente)
-    if not id_destino_cliente:
-        print("Nao foi possivel espelhar o cliente na ATIVA.")
-        return False
-
-    # --- 4.3b Filtro por estado do cliente ---
-    # Busca o estado do cliente na origem para decidir se roteia.
     cli_info = chamar_omie(
         OMIE_CLIENTE_URL, "ConsultarCliente",
         APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
@@ -252,6 +246,13 @@ def transferir_pedido_omie(codigo_pedido_origem):
               f"nao esta na lista permitida {ESTADOS_PERMITIDOS}.")
         return True  # nao e erro, apenas nao roteia para a ATIVA
 
+    # --- 4.3b Espelhar o cliente (cria/atualiza na ATIVA com dados fiscais) ---
+    print(f"Espelhando cliente origem {id_origem_cliente} ({estado_cliente})...")
+    id_destino_cliente = espelhar_cliente_destino(id_origem_cliente)
+    if not id_destino_cliente:
+        print("Nao foi possivel espelhar o cliente na ATIVA.")
+        return False
+
     pedido["cabecalho"]["codigo_cliente"] = id_destino_cliente
 
     # --- 4.4 Limpeza de IDs internos da ORIGEM no cabecalho ---
@@ -260,7 +261,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
     cab.pop("numero_pedido", None)
     cab.pop("codigo_cenario_impostos", None)
     cab["codigo_pedido_integracao"] = codigo_integracao_destino
-    # A etapa "10" e do fluxo da FRI e nao existe como entrada na ATIVA.
+    # A etapa "80" e do fluxo da FRI e nao existe como entrada na ATIVA.
     # Entra sempre na etapa inicial padrao do destino (10 = registrado).
     cab["etapa"] = ETAPA_ENTRADA_DESTINO
     # origem_pedido "ERP" da FRI nao e aceita na ATIVA. Como entra via API,

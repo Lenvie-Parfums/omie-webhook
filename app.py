@@ -52,6 +52,8 @@ CATEGORIA_PADRAO = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 # 6760726795 = "Itau Unibanco" (conta de teste). Ajuste para a conta de
 # recebimento correta definida pelo financeiro, se necessario.
 CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"))
+# Codigo de parcela/condicao de pagamento. "000" = a vista (universal).
+CODIGO_PARCELA_PADRAO = os.environ.get("CODIGO_PARCELA_PADRAO", "000")
 # Estados cujos pedidos devem ser roteados para a ATIVA.
 # Pedidos de clientes em outros estados sao ignorados.
 ESTADOS_PERMITIDOS = set(

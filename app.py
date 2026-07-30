@@ -227,7 +227,11 @@ def transferir_pedido_omie(codigo_pedido_origem):
             if id_prod:
                 prod["codigo_produto"] = id_prod
             else:
-                print(f"ATENCAO: SKU {sku} nao cadastrado na ATIVA.")
+                # SKU nao existe no CNPJ 004: aborta em vez de mandar o ID
+                # da FRI (que nao vale no destino e daria erro na Omie).
+                print(f"ABORTANDO: SKU {sku} ({prod.get('descricao')}) "
+                      f"nao cadastrado no CNPJ 004. Cadastre e reenvie.")
+                return False
         prod.pop("valor_total", None)
 
         inf = item.get("inf_adic", {})

@@ -110,24 +110,19 @@ def resolver_produto_ativa(sku):
     if sku in _cache_produtos:
         return _cache_produtos[sku]
 
-    # Busca pelo codigo (SKU) na ATIVA via ListarProdutos
-    resp = chamar_omie(OMIE_PRODUTO_URL, "ListarProdutos",
+    # Busca produto pelo codigo (SKU) via ConsultarProduto
+    resp = chamar_omie(OMIE_PRODUTO_URL, "ConsultarProduto",
                        APP_KEY_DESTINO, APP_SECRET_DESTINO,
-                       {"pagina": 1, "registros_por_pagina": 5,
-                        "filtrar_apenas_omiepdv": "N",
-                        "filtrar_apenas_marketplace": "N",
-                        "codigo": sku})
-    prods = resp.get("produto_servico_cadastro", [])
-    # Filtra pelo codigo exato
-    for p in prods:
-        if str(p.get("codigo", "")).strip() == sku:
-            cod = p.get("codigo_produto")
-            _cache_produtos[sku] = cod
-            print(f"Produto SKU {sku} -> ID ATIVA {cod}")
-            return cod
+                       {"codigo": sku})
+    cod = resp.get("codigo_produto")
+    if cod:
+        _cache_produtos[sku] = cod
+        print(f"Produto SKU {sku} -> ID ATIVA {cod}")
+        return cod
 
-    print(f"SKU {sku} nao encontrado na ATIVA.")
-    _cache_produtos[sku] = None
+    print(f"SKU {sku} nao encontrado na ATIVA. Resp: {resp.get('faultstring', resp)}")
+    # NAO cachear resultado negativo — se o SKU for cadastrado depois,
+    # o cache pode estar mentindo. Ficaria travado ate reiniciar o servico.
     return None
 
 

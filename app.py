@@ -236,6 +236,23 @@ def transferir_pedido_omie(codigo_pedido_origem):
         if inf.get("codigo_categoria_item"):
             inf["codigo_categoria_item"] = CATEGORIA_PADRAO
 
+        # ------ RASTREABILIDADE: preserva lote/fabricacao/validade da FRI ------
+        # A FRI grava em obs_item.codigo_lote no formato:
+        #   "L118 27-01-2027 30-01-2028"  ->  lote  fabricacao  validade
+        # Repassamos o obs_item inteiro e ja preenchemos os campos separados
+        # que o IncluirPedido tambem aceita.
+        obs = item.get("obs_item") or {}
+        cod_lote_str = str(obs.get("codigo_lote", "")).strip()
+        if cod_lote_str:
+            partes = cod_lote_str.split()
+            if len(partes) >= 3:
+                item.setdefault("obs_item", {})["codigo_lote"] = cod_lote_str
+                # Campos separados aceitos pelo IncluirPedido:
+                item.setdefault("inf_adic", inf)
+                inf["cLote"]       = partes[0]
+                inf["dFabricacao"] = partes[1]
+                inf["dValidade"]   = partes[2]
+
     # 8.8 Remove blocos calculados
     for chave in ["infoCadastro", "total_pedido", "departamentos"]:
         pedido.pop(chave, None)

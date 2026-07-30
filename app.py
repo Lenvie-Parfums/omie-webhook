@@ -300,6 +300,10 @@ def receber_webhook():
 
         try:
             print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual} | {topic})...")
+            # vendaproduto.incluida dispara antes dos itens serem gravados.
+            # Aguarda para o pedido estar completo no momento da consulta.
+            if eh_inclusao:
+                time.sleep(5)
             sucesso = transferir_pedido_omie(codigo_pedido)
         finally:
             with _lock:

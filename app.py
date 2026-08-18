@@ -60,21 +60,27 @@ def chamar_omie(url, call, app_key, app_secret, param):
 
 
 # ==========================================================
-# 5. ESPELHAR CLIENTE (FRI -> ATIVA)
+# 5. CLIENTE (FRI -> ATIVA)
 # ==========================================================
-def espelhar_cliente_destino(codigo_cliente_origem):
-    cli = chamar_omie(OMIE_CLIENTE_URL, "ConsultarCliente",
-                      APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
-                      {"codigo_cliente_omie": codigo_cliente_origem})
+def consultar_cliente_origem(codigo_cliente_origem):
+    """Le o cadastro do cliente na FRI. Retorna o dict inteiro ou {}."""
+    return chamar_omie(OMIE_CLIENTE_URL, "ConsultarCliente",
+                       APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+                       {"codigo_cliente_omie": codigo_cliente_origem}) or {}
 
+
+def espelhar_cliente_destino(cli):
+    """
+    Recebe o cadastro ja lido da FRI e cria/atualiza no CNPJ 004.
+    Retorna o codigo_cliente_omie do destino.
+    """
     cnpj_cpf = cli.get("cnpj_cpf")
     if not cnpj_cpf:
         print("Cliente sem CNPJ/CPF. Abortando.")
-        return None, None
+        return None
 
-    cnpj_limpo   = "".join(filter(str.isalnum, cnpj_cpf))
-    cod_int      = f"FRI-{cnpj_limpo}"
-    estado       = cli.get("estado", "").upper().strip()
+    cnpj_limpo = "".join(filter(str.isalnum, cnpj_cpf))
+    cod_int    = f"FRI-{cnpj_limpo}"
 
     campos = [
         "razao_social", "nome_fantasia", "cnpj_cpf", "email",
@@ -95,11 +101,11 @@ def espelhar_cliente_destino(codigo_cliente_origem):
 
     id_destino = res.get("codigo_cliente_omie")
     if id_destino:
-        print(f"Cliente espelhado na ATIVA. ID: {id_destino} | Estado: {estado}")
-        return id_destino, estado
+        print(f"Cliente espelhado na ATIVA. ID: {id_destino}")
+        return id_destino
 
     print(f"UpsertCliente falhou: {res}")
-    return None, estado
+    return None
 
 
 # ==========================================================
@@ -166,14 +172,18 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if pedido_ja_existe_na_ativa(cod_int_destino):
         return True
 
-    # 8.3 Filtra por estado ANTES de espelhar cliente
+    # 8.3 Filtra por estado ANTES de mexer no CNPJ 004
+    # Le o cadastro do cliente na FRI para descobrir o estado.
     id_cliente_origem = pedido["cabecalho"].get("codigo_cliente")
-    id_cliente_destino, estado = espelhar_cliente_destino(id_cliente_origem)
+    cli = consultar_cliente_origem(id_cliente_origem)
+    estado = str(cli.get("estado", "")).upper().strip()
 
     if ESTADOS_PERMITIDOS and estado not in ESTADOS_PERMITIDOS:
         print(f"Pedido ignorado: estado [{estado}] fora da lista {ESTADOS_PERMITIDOS}.")
         return True
 
+    # Estado autorizado: agora sim espelha o cliente no CNPJ 004
+    id_cliente_destino = espelhar_cliente_destino(cli)
     if not id_cliente_destino:
         print("Nao foi possivel espelhar o cliente.")
         return False

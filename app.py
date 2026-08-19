@@ -39,6 +39,7 @@ _lock = threading.Lock()
 # Cache de produtos em memoria: SKU -> codigo_produto da ATIVA
 # Preenchido na primeira vez que cada SKU e consultado.
 _cache_produtos = {}
+_cache_clientes = {}  # codigo_cliente_omie -> dict completo do cliente
 
 
 # ==========================================================
@@ -172,17 +173,12 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if pedido_ja_existe_na_ativa(cod_int_destino):
         return True
 
-    # 8.3 Filtra por estado ANTES de mexer no CNPJ 004
-    # Le o cadastro do cliente na FRI para descobrir o estado.
+    # 8.3 Le e espelha o cliente (estado ja foi verificado no webhook)
     id_cliente_origem = pedido["cabecalho"].get("codigo_cliente")
     cli = consultar_cliente_origem(id_cliente_origem)
     estado = str(cli.get("estado", "")).upper().strip()
+    print(f"Processando pedido de cliente no estado [{estado}]...")
 
-    if ESTADOS_PERMITIDOS and estado not in ESTADOS_PERMITIDOS:
-        print(f"Pedido ignorado: estado [{estado}] fora da lista {ESTADOS_PERMITIDOS}.")
-        return True
-
-    # Estado autorizado: agora sim espelha o cliente no CNPJ 004
     id_cliente_destino = espelhar_cliente_destino(cli)
     if not id_cliente_destino:
         print("Nao foi possivel espelhar o cliente.")
@@ -277,10 +273,21 @@ def receber_webhook():
     topic       = str(payload.get('topic', '')).lower() if payload else ''
     codigo_pedido = mensagem.get('idPedido') or mensagem.get('codigo_pedido')
     etapa_atual = str(mensagem.get('etapa', ''))
+    id_cliente_webhook = mensagem.get('idCliente')
 
     eh_inclusao = 'incluido' in topic or 'incluida' in topic
 
     if etapa_atual == ETAPA_GATILHO or eh_inclusao:
+        # Filtra por estado ANTES de qualquer chamada pesada (ConsultarPedido).
+        # O idCliente ja vem no payload do webhook — apenas ConsultarCliente.
+        if ESTADOS_PERMITIDOS and id_cliente_webhook:
+            cli_check = consultar_cliente_origem(id_cliente_webhook)
+            estado_check = str(cli_check.get("estado", "")).upper().strip()
+            if estado_check not in ESTADOS_PERMITIDOS:
+                print(f"Pedido {codigo_pedido} ignorado: estado [{estado_check}] "
+                      f"fora da lista {ESTADOS_PERMITIDOS}.")
+                return jsonify({"status": "ignorado_estado"}), 200
+
         agora = time.time()
         with _lock:
             if codigo_pedido in _pedidos_em_processamento:

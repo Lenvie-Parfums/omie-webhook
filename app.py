@@ -22,6 +22,7 @@ OMIE_PRODUTO_URL = "https://app.omie.com.br/api/v1/geral/produtos/"
 # 2. CONFIGURACOES
 # ==========================================================
 ETAPA_GATILHO        = "10"
+ETAPAS_GATILHO       = {"10", "00"}  # 00 = codigo interno da Omie para Pedido de Venda (etapa 10)
 ETAPA_ENTRADA_DESTINO = "10"
 CATEGORIA_PADRAO      = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"))
@@ -335,7 +336,7 @@ def receber_webhook():
 
     eh_inclusao = 'incluido' in topic or 'incluida' in topic
 
-    if etapa_atual == ETAPA_GATILHO or eh_inclusao:
+    if etapa_atual in ETAPAS_GATILHO or eh_inclusao:
         # Filtra por estado ANTES de qualquer chamada pesada (ConsultarPedido).
         # O idCliente ja vem no payload do webhook — apenas ConsultarCliente.
         if ESTADOS_PERMITIDOS and id_cliente_webhook:

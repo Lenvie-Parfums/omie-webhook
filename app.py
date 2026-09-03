@@ -327,6 +327,7 @@ def receber_webhook():
         return jsonify({"status": "ok"}), 200
 
     mensagem    = payload.get('event', {}) if payload else {}
+    print(f"PAYLOAD: topic={payload.get('topic')} etapa={mensagem.get('etapa')} idPedido={mensagem.get('idPedido')} idCliente={mensagem.get('idCliente')}")
     topic       = str(payload.get('topic', '')).lower() if payload else ''
     codigo_pedido = mensagem.get('idPedido') or mensagem.get('codigo_pedido')
     etapa_atual = str(mensagem.get('etapa', ''))

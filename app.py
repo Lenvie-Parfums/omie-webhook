@@ -64,15 +64,22 @@ def chamar_omie(url, call, app_key, app_secret, param):
 # 5. CLIENTE (FRI -> ATIVA)
 # ==========================================================
 def consultar_cliente_origem(codigo_cliente_origem):
-    """Le o cadastro do cliente na FRI. Retorna o dict inteiro ou {}."""
-    return chamar_omie(OMIE_CLIENTE_URL, "ConsultarCliente",
-                       APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
-                       {"codigo_cliente_omie": codigo_cliente_origem}) or {}
+    """Le o cadastro do cliente na FRI. Usa cache para evitar chamadas repetidas."""
+    codigo_cliente_origem = int(codigo_cliente_origem)
+    if codigo_cliente_origem in _cache_clientes:
+        return _cache_clientes[codigo_cliente_origem]
+    cli = chamar_omie(OMIE_CLIENTE_URL, "ConsultarCliente",
+                      APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+                      {"codigo_cliente_omie": codigo_cliente_origem}) or {}
+    if cli and not cli.get("faultstring"):
+        _cache_clientes[codigo_cliente_origem] = cli
+    return cli
 
 
 def espelhar_cliente_destino(cli):
     """
     Recebe o cadastro ja lido da FRI e cria/atualiza no CNPJ 004.
+    Se o CNPJ ja existir com outro codigo de integracao, busca o ID existente.
     Retorna o codigo_cliente_omie do destino.
     """
     cnpj_cpf = cli.get("cnpj_cpf")
@@ -105,6 +112,23 @@ def espelhar_cliente_destino(cli):
         print(f"Cliente espelhado na ATIVA. ID: {id_destino}")
         return id_destino
 
+    # UpsertCliente falhou — pode ser CNPJ ja cadastrado com outro cod. integracao.
+    # Tenta buscar o cliente pelo CNPJ diretamente.
+    fault = res.get("faultstring", "")
+    if "já cadastrado" in fault or "ja cadastrado" in fault.lower():
+        print(f"Cliente ja existe na ATIVA com outro codigo de integracao. Buscando por CNPJ...")
+        busca = chamar_omie(
+            OMIE_CLIENTE_URL, "ListarClientes",
+            APP_KEY_DESTINO, APP_SECRET_DESTINO,
+            {"pagina": 1, "registros_por_pagina": 5,
+             "clientesFiltro": {"cnpj_cpf": cnpj_limpo}}
+        )
+        clientes = busca.get("clientes_cadastro", [])
+        if clientes:
+            id_destino = clientes[0].get("codigo_cliente_omie")
+            print(f"Cliente encontrado na ATIVA por CNPJ. ID: {id_destino}")
+            return id_destino
+
     print(f"UpsertCliente falhou: {res}")
     return None
 
@@ -117,7 +141,7 @@ def resolver_produto_ativa(sku):
     if sku in _cache_produtos:
         return _cache_produtos[sku]
 
-    # Busca produto pelo codigo (SKU) via ConsultarProduto
+    # Busca produto pelo codigo (SKU) via ConsultarProduto na ATIVA
     resp = chamar_omie(OMIE_PRODUTO_URL, "ConsultarProduto",
                        APP_KEY_DESTINO, APP_SECRET_DESTINO,
                        {"codigo": sku})
@@ -127,9 +151,45 @@ def resolver_produto_ativa(sku):
         print(f"Produto SKU {sku} -> ID ATIVA {cod}")
         return cod
 
-    print(f"SKU {sku} nao encontrado na ATIVA. Resp: {resp.get('faultstring', resp)}")
-    # NAO cachear resultado negativo — se o SKU for cadastrado depois,
-    # o cache pode estar mentindo. Ficaria travado ate reiniciar o servico.
+    # Nao encontrado na ATIVA — tenta buscar na FRI e replicar
+    print(f"SKU {sku} nao encontrado na ATIVA. Buscando na FRI para replicar...")
+    prod_fri = chamar_omie(OMIE_PRODUTO_URL, "ConsultarProduto",
+                           APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+                           {"codigo": sku})
+    if "faultstring" in prod_fri or not prod_fri.get("codigo_produto"):
+        print(f"SKU {sku} tambem nao encontrado na FRI. Nao e possivel replicar.")
+        return None
+
+    # Monta payload para replicar o produto na ATIVA
+    campos = [
+        "codigo", "descricao", "tipoItem", "ncm", "cest", "ean",
+        "unidade", "valor_unitario", "peso_liq", "peso_bruto",
+        "altura", "largura", "profundidade", "marca", "descr_detalhada",
+        "unidade_tributavel", "quantidade_tributavel",
+    ]
+    payload_prod = {}
+    for c in campos:
+        if prod_fri.get(c) not in (None, "", 0):
+            payload_prod[c] = prod_fri[c]
+
+    # Familia LENVIE no CNPJ 004
+    if prod_fri.get("codigo_familia"):
+        payload_prod["codigo_familia"] = 7243824999
+
+    payload_prod["codigo_produto_integracao"] = sku
+    payload_prod["origem_mercadoria"] = (
+        prod_fri.get("recomendacoes_fiscais", {}).get("origem_mercadoria", "0")
+    )
+
+    res_upsert = chamar_omie(OMIE_PRODUTO_URL, "UpsertProduto",
+                             APP_KEY_DESTINO, APP_SECRET_DESTINO, payload_prod)
+    cod_novo = res_upsert.get("codigo_produto")
+    if cod_novo:
+        _cache_produtos[sku] = cod_novo
+        print(f"SKU {sku} replicado automaticamente na ATIVA. ID: {cod_novo}")
+        return cod_novo
+
+    print(f"Falha ao replicar SKU {sku} na ATIVA: {res_upsert.get('faultstring', res_upsert)}")
     return None
 
 
@@ -228,10 +288,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
             if id_prod:
                 prod["codigo_produto"] = id_prod
             else:
-                # SKU nao existe no CNPJ 004: aborta em vez de mandar o ID
-                # da FRI (que nao vale no destino e daria erro na Omie).
-                print(f"ABORTANDO: SKU {sku} ({prod.get('descricao')}) "
-                      f"nao cadastrado no CNPJ 004. Cadastre e reenvie.")
+                print(f"ABORTANDO: SKU {sku} nao resolvido nem na FRI nem na ATIVA.")
                 return False
         prod.pop("valor_total", None)
 

@@ -1,3 +1,5 @@
+import json
+import re
 import os
 import time
 import threading
@@ -17,6 +19,7 @@ APP_SECRET_DESTINO = os.environ.get("APP_SECRET_DESTINO", "e3e98a53e601102596075
 OMIE_PEDIDO_URL  = "https://app.omie.com.br/api/v1/produtos/pedido/"
 OMIE_CLIENTE_URL = "https://app.omie.com.br/api/v1/geral/clientes/"
 OMIE_PRODUTO_URL = "https://app.omie.com.br/api/v1/geral/produtos/"
+OMIE_VENDEDOR_URL = "https://app.omie.com.br/api/v1/geral/vendedores/"
 
 # ==========================================================
 # 2. CONFIGURACOES
@@ -39,6 +42,7 @@ _lock = threading.Lock()
 # Cache de produtos em memoria: SKU -> codigo_produto da ATIVA
 # Preenchido na primeira vez que cada SKU e consultado.
 _cache_produtos = {}
+_cache_referencias = {}
 _cache_clientes = {}  # codigo_cliente_omie -> dict completo do cliente
 
 
@@ -206,6 +210,181 @@ def pedido_existente_na_ativa(codigo_integracao):
 # ==========================================================
 # 8. TRANSFERENCIA DO PEDIDO
 # ==========================================================
+def consultar_referencia(url, chamada, key, secret, parametros, aceitar_vazio=False):
+    time.sleep(1.1)
+    resposta = chamar_omie(url, chamada, key, secret, parametros)
+    falha = resposta.get("faultstring")
+    if aceitar_vazio and falha and re.fullmatch(
+        r"(?:ERROR:\s*)?N[aã]o existem registros para a p[aá]gina \[1\][!.]?", falha.strip(), re.I,
+    ):
+        return {}
+    if falha or resposta.get("faultcode") or not resposta:
+        raise ValueError(f"{chamada} recusada pela Omie: {falha or 'resposta invalida'}.")
+    return resposta
+
+
+def resolver_referencia(grupo, codigo):
+    chave = (grupo, str(codigo))
+    agora = time.monotonic()
+    cache = _cache_referencias.get(chave)
+    if cache and agora < cache[0]:
+        return cache[1]
+
+    if grupo == "vendedores":
+        origem = consultar_referencia(
+            OMIE_VENDEDOR_URL, "ConsultarVendedor", APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+            {"codigo": int(codigo)},
+        )
+        nome = str(origem.get("nome") or "").strip()
+        email = str(origem.get("email") or "").strip().casefold()
+        if not nome:
+            raise ValueError("Vendedor sem nome na 001.")
+        resposta = consultar_referencia(
+            OMIE_VENDEDOR_URL, "ListarVendedores", APP_KEY_DESTINO, APP_SECRET_DESTINO,
+            {"pagina": 1, "registros_por_pagina": 100, "filtrar_por_nome": nome},
+            aceitar_vazio=True,
+        )
+        candidatos = [
+            v["codigo"] for v in resposta.get("cadastro", [])
+            if v.get("codigo") and v.get("inativo") != "S"
+            and str(v.get("nome") or "").strip().casefold() == nome.casefold()
+            and (not email or str(v.get("email") or "").strip().casefold() == email)
+        ]
+    else:
+        origem = consultar_referencia(
+            OMIE_CLIENTE_URL, "ConsultarCliente", APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
+            {"codigo_cliente_omie": int(codigo)},
+        )
+        nome = str(origem.get("razao_social") or origem.get("nome_fantasia") or "").strip()
+        documento = re.sub(r"[^A-Za-z0-9]", "", str(origem.get("cnpj_cpf") or ""))
+        if not documento:
+            raise ValueError("Transportadora sem CNPJ/CPF na 001.")
+        resposta = consultar_referencia(
+            OMIE_CLIENTE_URL, "ListarClientes", APP_KEY_DESTINO, APP_SECRET_DESTINO,
+            {"pagina": 1, "registros_por_pagina": 100, "clientesFiltro": {"cnpj_cpf": documento}},
+            aceitar_vazio=True,
+        )
+        candidatos = [
+            c["codigo_cliente_omie"] for c in resposta.get("clientes_cadastro", [])
+            if c.get("codigo_cliente_omie") and c.get("inativo") != "S"
+            and re.sub(r"[^A-Za-z0-9]", "", str(c.get("cnpj_cpf") or "")).upper() == documento.upper()
+        ]
+
+    resultado = (candidatos[0] if len(candidatos) == 1 and int(resposta.get("total_de_paginas") or 1) == 1 else None, nome)
+    _cache_referencias[chave] = (agora + (3600 if resultado[0] else 300), resultado)
+    return resultado
+
+
+def mapear_cadastro(pedido, bloco, campo, mapa, grupo, rotulo):
+    origem = bloco.get(campo)
+    mapear_campo(bloco, campo, mapa, grupo)
+    if not origem or campo in bloco:
+        return
+    destino, nome = resolver_referencia(grupo, origem)
+    if destino:
+        bloco[campo] = destino
+        return
+    if nome:
+        observacoes = pedido.setdefault("observacoes", {})
+        nota = f"{rotulo} na 001: {nome}"
+        existente = observacoes.get("obs_venda") or ""
+        observacoes["obs_venda"] = f"{existente} | {nota}" if existente else nota
+    print(f"{rotulo} da 001 sem correspondencia unica na 004.")
+
+
+def mapear_campo(bloco, campo, mapa, grupo):
+    codigo_origem = bloco.pop(campo, None)
+    codigo_destino = mapa.get(grupo, {}).get(str(codigo_origem))
+    if codigo_destino is not None:
+        bloco[campo] = codigo_destino
+
+
+def preparar_dados_destino(pedido, mapa):
+    cab = pedido["cabecalho"]
+    codigo_parcela = str(cab.get("codigo_parcela") or "").strip()
+    parcelas = (pedido.pop("lista_parcelas", None) or {}).get("parcela") or []
+    codigo_mapeado = mapa.get("parcelas", {}).get(codigo_parcela)
+
+    if parcelas:
+        campos = (
+            "numero_parcela", "valor", "percentual", "data_vencimento", "quantidade_dias",
+            "tipo_documento", "meio_pagamento", "descr_meio_pagamento", "nsu",
+            "nao_gerar_boleto", "parcela_adiantamento", "bandeira", "cnpj_fin",
+        )
+        parcelas_destino = []
+        for parcela in parcelas:
+            destino = {campo: parcela[campo] for campo in campos if parcela.get(campo) not in (None, "")}
+            if destino.get("parcela_adiantamento") == "S":
+                for campo, grupo in (("categoria_adiantamento", "categorias"), ("conta_corrente_adiantamento", "contas_correntes")):
+                    codigo = mapa.get(grupo, {}).get(str(parcela.get(campo)))
+                    if codigo is None:
+                        raise ValueError(f"Parcela de adiantamento sem de-para de {grupo}.")
+                    destino[campo] = codigo
+            if not destino.get("numero_parcela") or not (
+                destino.get("data_vencimento") or "quantidade_dias" in destino
+            ) or not ("valor" in destino or "percentual" in destino):
+                raise ValueError("Parcela sem numero, vencimento ou valor/percentual na 001.")
+            parcelas_destino.append(destino)
+        if len({p["numero_parcela"] for p in parcelas_destino}) != len(parcelas_destino):
+            raise ValueError("Numeros de parcela repetidos na 001.")
+        if cab.get("qtde_parcelas") and int(cab["qtde_parcelas"]) != len(parcelas_destino):
+            raise ValueError("Quantidade de parcelas difere da lista retornada pela 001.")
+        cab["codigo_parcela"] = "999"
+        cab["qtde_parcelas"] = len(parcelas_destino)
+        pedido["lista_parcelas"] = {"parcela": parcelas_destino}
+    elif codigo_mapeado is not None and str(codigo_mapeado) != "999":
+        cab["codigo_parcela"] = str(codigo_mapeado)
+    elif codigo_parcela == "000" and str(cab.get("qtde_parcelas") or "1") == "1" and CODIGO_PARCELA_PADRAO == "000":
+        cab["codigo_parcela"] = "000"
+        cab["qtde_parcelas"] = 1
+    else:
+        raise ValueError("Condicao de pagamento sem parcelas na 001 ou de-para para a 004.")
+
+    mapear_campo(cab, "codigo_cenario_impostos", mapa, "cenarios_fiscais")
+    frete = pedido.get("frete")
+    if not isinstance(frete, dict):
+        frete = {}
+    codigo_transportadora = cab.pop("codigo_transportadora", None)
+    if codigo_transportadora and not frete.get("codigo_transportadora"):
+        frete["codigo_transportadora"] = codigo_transportadora
+    mapear_cadastro(pedido, frete, "codigo_transportadora", mapa, "transportadoras", "Transportadora")
+    frete.pop("codigo_transportadora_integracao", None)
+    if frete:
+        pedido["frete"] = frete
+
+    adicionais = pedido.get("informacoes_adicionais")
+    if not isinstance(adicionais, dict):
+        adicionais = {}
+    for campo, grupo in (
+        ("codigo_categoria", "categorias"), ("codigo_conta_corrente", "contas_correntes"),
+        ("codProj", "projetos"),
+    ):
+        mapear_campo(adicionais, campo, mapa, grupo)
+    mapear_cadastro(pedido, adicionais, "codVend", mapa, "vendedores", "Vendedor")
+    adicionais.setdefault("codigo_categoria", CATEGORIA_PADRAO)
+    adicionais.setdefault("codigo_conta_corrente", CONTA_CORRENTE_PADRAO)
+    pedido["informacoes_adicionais"] = adicionais
+
+    departamentos = pedido.pop("departamentos", None) or []
+    for departamento in departamentos:
+        mapear_campo(departamento, "cCodDepto", mapa, "departamentos")
+    # Mantem o rateio completo apenas quando todos os departamentos tem equivalente.
+    if departamentos and all(departamento.get("cCodDepto") for departamento in departamentos):
+        pedido["departamentos"] = departamentos
+
+    for item in pedido.get("det", []):
+        inf = item.get("inf_adic") or {}
+        for campo, grupo in (
+            ("codigo_local_estoque", "locais_estoque"),
+            ("codigo_cenario_impostos_item", "cenarios_fiscais"),
+            ("codigo_categoria_item", "categorias"),
+        ):
+            if campo in inf and inf[campo]:
+                mapear_campo(inf, campo, mapa, grupo)
+                if campo == "codigo_categoria_item":
+                    inf.setdefault(campo, CATEGORIA_PADRAO)
+
+
 def transferir_pedido_omie(codigo_pedido_origem):
     # 8.1 Consulta na FRI
     bruto = chamar_omie(OMIE_PEDIDO_URL, "ConsultarPedido",
@@ -254,6 +433,15 @@ def transferir_pedido_omie(codigo_pedido_origem):
         print(f"{identificacao} | {destino} ja existe.")
         return "ja_existe"
 
+    try:
+        mapa = json.loads(os.environ.get("OMIE_DE_PARA_004", "{}"))
+        if not isinstance(mapa, dict) or not all(isinstance(grupo, dict) for grupo in mapa.values()):
+            raise ValueError("OMIE_DE_PARA_004 precisa conter grupos de codigos origem/destino.")
+        preparar_dados_destino(pedido, mapa)
+    except (ValueError, TypeError, AttributeError) as erro:
+        print(f"{identificacao} | Dados de destino inconsistentes: {erro}")
+        return "erro"
+
     print(f"{identificacao} | Iniciando replicacao para a 004.")
 
     id_cliente_destino = espelhar_cliente_destino(cli)
@@ -266,31 +454,10 @@ def transferir_pedido_omie(codigo_pedido_origem):
     cab["codigo_pedido_integracao"]  = cod_int_destino
     cab["etapa"]                     = ETAPA_ENTRADA_DESTINO
     cab["origem_pedido"]             = "API"
-    cab["codigo_parcela"]            = CODIGO_PARCELA_PADRAO
-    cab["qtde_parcelas"]             = 1
-    cab.pop("codigo_pedido",          None)
-    cab.pop("numero_pedido",          None)
-    cab.pop("codigo_cenario_impostos",None)
-    cab.pop("codigo_transportadora",  None)
-    pedido.pop("lista_parcelas",      None)
+    cab.pop("codigo_pedido", None)
+    cab.pop("numero_pedido", None)
 
-    # 8.5 Informacoes adicionais
-    inf_ad = pedido.get("informacoes_adicionais")
-    if isinstance(inf_ad, dict):
-        inf_ad["codigo_categoria"]     = CATEGORIA_PADRAO
-        inf_ad["codigo_conta_corrente"]= CONTA_CORRENTE_PADRAO
-        inf_ad.pop("codVend",            None)
-    else:
-        pedido["informacoes_adicionais"] = {
-            "codigo_categoria":      CATEGORIA_PADRAO,
-            "codigo_conta_corrente": CONTA_CORRENTE_PADRAO,
-        }
-
-    # 8.6 Frete
-    if isinstance(pedido.get("frete"), dict):
-        pedido["frete"].pop("codigo_transportadora", None)
-
-    # 8.7 Itens
+    # 8.5 Itens
     for item in pedido.get("det", []):
         ide = item.get("ide", {})
         ide.pop("codigo_item_pedido", None)
@@ -308,20 +475,15 @@ def transferir_pedido_omie(codigo_pedido_origem):
                 return "erro"
         prod.pop("valor_total", None)
 
-        inf = item.get("inf_adic", {})
-        inf.pop("codigo_local_estoque",         None)
-        inf.pop("codigo_cenario_impostos_item",  None)
-        if inf.get("codigo_categoria_item"):
-            inf["codigo_categoria_item"] = CATEGORIA_PADRAO
         # Preserva obs_item (contem lote/fabricacao/validade da FRI)
         # para o webhook-rastreabilidade nao cancelar o pedido no destino.
         # O obs_item ja vem no item original e nao e removido.
 
-    # 8.8 Remove blocos calculados
-    for chave in ["infoCadastro", "total_pedido", "departamentos"]:
+    # 8.6 Remove blocos calculados
+    for chave in ("infoCadastro", "total_pedido"):
         pedido.pop(chave, None)
 
-    # 8.9 Inclui na ATIVA
+    # 8.7 Inclui na ATIVA
     res = chamar_omie(OMIE_PEDIDO_URL, "IncluirPedido",
                       APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido)
     if "codigo_pedido" in res:

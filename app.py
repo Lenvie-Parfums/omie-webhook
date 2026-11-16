@@ -196,14 +196,11 @@ def resolver_produto_ativa(sku):
 # ==========================================================
 # 7. IDEMPOTENCIA
 # ==========================================================
-def pedido_ja_existe_na_ativa(codigo_integracao):
+def pedido_existente_na_ativa(codigo_integracao):
     resp = chamar_omie(OMIE_PEDIDO_URL, "ConsultarPedido",
                        APP_KEY_DESTINO, APP_SECRET_DESTINO,
                        {"codigo_pedido_integracao": codigo_integracao})
-    if resp.get("pedido_venda_produto", resp).get("cabecalho"):
-        print(f"Pedido {codigo_integracao} ja existe na ATIVA. Ignorando.")
-        return True
-    return False
+    return resp.get("pedido_venda_produto", resp).get("cabecalho")
 
 
 # ==========================================================
@@ -236,23 +233,32 @@ def transferir_pedido_omie(codigo_pedido_origem):
     if not cli or cli.get("faultstring"):
         print("Falha ao consultar cliente na origem.")
         return "erro"
-    estado = str(cli.get("estado", "")).strip().upper()
+    estado = str(cli.get("estado") or "").strip().upper()
+    nome = str(cli.get("nome_fantasia") or "").strip() or str(cli.get("razao_social") or "").strip()
+    numero_001 = cab.get("numero_pedido") or "(numero indisponivel)"
+    identificacao = f"Pedido 001 {numero_001} | Cliente: {nome or '(nome indisponivel)'} | UF: {estado}"
     if estado not in ESTADOS_PERMITIDOS:
-        print(f"Pedido {codigo_pedido_origem} ignorado: UF [{estado}] fora da lista.")
+        print(f"{identificacao} | Ignorado: UF fora da lista.")
         return "ignorado_estado"
 
     if not pedido.get("det"):
-        print(f"Pedido {codigo_pedido_origem} ainda sem itens.")
+        print(f"{identificacao} | Aguardando itens.")
         return "aguardando_itens"
 
     cod_int = cab.get("codigo_pedido_integracao") or str(codigo_pedido_origem)
     cod_int_destino = f"{cod_int}-ATIVA"
-    if pedido_ja_existe_na_ativa(cod_int_destino):
+    pedido_existente = pedido_existente_na_ativa(cod_int_destino)
+    if pedido_existente:
+        numero_004 = pedido_existente.get("numero_pedido")
+        destino = f"Pedido 004 {numero_004}" if numero_004 else "Pedido na 004"
+        print(f"{identificacao} | {destino} ja existe.")
         return "ja_existe"
+
+    print(f"{identificacao} | Iniciando replicacao para a 004.")
 
     id_cliente_destino = espelhar_cliente_destino(cli)
     if not id_cliente_destino:
-        print("Nao foi possivel espelhar o cliente.")
+        print(f"{identificacao} | Nao foi possivel espelhar o cliente.")
         return "erro"
 
     # 8.4 Ajusta cabecalho
@@ -298,7 +304,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
             if id_prod:
                 prod["codigo_produto"] = id_prod
             else:
-                print(f"ABORTANDO: SKU {sku} nao resolvido nem na FRI nem na ATIVA.")
+                print(f"{identificacao} | SKU {sku} nao resolvido na FRI ou na ATIVA.")
                 return "erro"
         prod.pop("valor_total", None)
 
@@ -319,10 +325,12 @@ def transferir_pedido_omie(codigo_pedido_origem):
     res = chamar_omie(OMIE_PEDIDO_URL, "IncluirPedido",
                       APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido)
     if "codigo_pedido" in res:
-        print(f"SUCESSO! Pedido gravado na ATIVA. Novo ID: {res['codigo_pedido']}")
+        numero_004 = res.get("numero_pedido")
+        destino = f"Pedido 004 {numero_004}" if numero_004 else "Pedido na 004"
+        print(f"{identificacao} | {destino} criado.")
         return "transferido"
 
-    print(f"ERRO DO OMIE (ATIVA): {res}")
+    print(f"{identificacao} | Erro na 004: {res.get('faultstring') or 'resposta sem confirmacao'}")
     return "erro"
 
 

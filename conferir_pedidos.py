@@ -6,83 +6,121 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from app import (
-    ESTADOS_PERMITIDOS,
-    ETAPAS_GATILHO,
-    OMIE_PEDIDO_URL,
-    chamar_omie,
-    consultar_cliente_origem,
-)
+import requests
+
+from app import ESTADOS_PERMITIDOS, ETAPAS_GATILHO, OMIE_CLIENTE_URL, OMIE_PEDIDO_URL
 
 
-def consultar_pedidos_origem(inicio, fim):
+INTERVALO_API = 1.1
+SEM_REGISTROS = re.compile(r"(?:ERROR:\s*)?N[aã]o existem registros para a p[aá]gina \[1\][!.]?", re.I)
+
+
+def consultar_omie(url, metodo, empresa, parametros):
+    ambiente = "ORIGEM" if empresa == "001" else "DESTINO"
+    contexto = f"Omie {empresa} / {metodo}"
+    time.sleep(INTERVALO_API)
+    try:
+        resposta = requests.post(url, json={
+            "call": metodo,
+            "app_key": os.environ[f"APP_KEY_{ambiente}"],
+            "app_secret": os.environ[f"APP_SECRET_{ambiente}"],
+            "param": [parametros],
+        }, timeout=60)
+    except requests.RequestException:
+        raise RuntimeError(f"{contexto}: falha de conexao.") from None
+    if resposta.status_code in (425, 429):
+        raise RuntimeError(f"{contexto}: limite ou bloqueio HTTP {resposta.status_code}.")
+
+    try:
+        dados = resposta.json()
+    except ValueError:
+        raise RuntimeError(f"{contexto}: resposta invalida (HTTP {resposta.status_code}).") from None
+    if not isinstance(dados, dict):
+        raise RuntimeError(f"{contexto}: formato de resposta invalido.")
+    falha = str(dados.get("faultstring", ""))
+    codigo = str(dados.get("faultcode", ""))
+    if metodo == "ListarPedidos" and parametros["pagina"] == 1 and SEM_REGISTROS.fullmatch(falha.strip()):
+        return {"total_de_paginas": 0, "pedido_venda_produto": []}
+    if falha or codigo or not resposta.ok:
+        bloqueio = re.search(r"MISUSE_API_PROCESS|REDUNDANT|bloquead[ao]|too many requests", f"{codigo} {falha}", re.I)
+        motivo = "limite, bloqueio ou consulta redundante" if bloqueio else "consulta rejeitada"
+        raise RuntimeError(f"{contexto}: {motivo} (HTTP {resposta.status_code}).")
+    return dados
+
+
+def listar_pedidos(empresa, inicio, fim):
     pagina = 1
     while True:
-        resposta = chamar_omie(
-            OMIE_PEDIDO_URL, "ListarPedidos",
-            os.environ["APP_KEY_ORIGEM"], os.environ["APP_SECRET_ORIGEM"],
-            {
-                "pagina": pagina,
-                "registros_por_pagina": 100,
-                "apenas_resumo": "N",
-                "filtrar_por_data_de": inicio.strftime("%d/%m/%Y"),
-                "filtrar_por_data_ate": fim.strftime("%d/%m/%Y"),
-            },
-        )
-        if resposta.get("faultstring") or "total_de_paginas" not in resposta:
-            raise RuntimeError(f"ListarPedidos na 001 falhou na pagina {pagina}.")
-        yield from resposta.get("pedido_venda_produto", [])
-        if pagina >= int(resposta["total_de_paginas"]):
-            break
+        dados = consultar_omie(OMIE_PEDIDO_URL, "ListarPedidos", empresa, {
+            "pagina": pagina,
+            "registros_por_pagina": 100,
+            "apenas_resumo": "N",
+            "filtrar_por_data_de": inicio.strftime("%d/%m/%Y"),
+            "filtrar_por_data_ate": fim.strftime("%d/%m/%Y"),
+        })
+        total_paginas = dados.get("total_de_paginas")
+        pedidos = dados.get("pedido_venda_produto", [])
+        if not str(total_paginas).isdigit() or not isinstance(pedidos, list):
+            raise RuntimeError(f"ListarPedidos na {empresa}: paginacao invalida.")
+        if not pedidos and int(total_paginas) >= pagina:
+            raise RuntimeError(f"ListarPedidos na {empresa}: pagina {pagina} vazia.")
+        yield from pedidos
+        if pagina >= int(total_paginas):
+            return
         pagina += 1
-        time.sleep(0.5)
-
-
-def conferir_destino(codigo_integracao):
-    resposta = chamar_omie(
-        OMIE_PEDIDO_URL, "ConsultarPedido",
-        os.environ["APP_KEY_DESTINO"], os.environ["APP_SECRET_DESTINO"],
-        {"codigo_pedido_integracao": codigo_integracao},
-    )
-    pedido = resposta.get("pedido_venda_produto", resposta)
-    cabecalho = pedido.get("cabecalho") or {}
-    if cabecalho.get("codigo_pedido") and cabecalho.get("codigo_pedido_integracao") == codigo_integracao:
-        return "confirmado", cabecalho.get("numero_pedido") or cabecalho["codigo_pedido"]
-
-    # Distingue uma ausencia confirmada de falhas de rede, autenticacao e limites.
-    falha = str(resposta.get("faultstring", ""))
-    if re.search(r"\bpedido\b.*\bn[ãa]o (?:encontrad[oa]|cadastrad[oa]|existe|localizad[oa])", falha, re.I):
-        return "pendente", None
-    return "erro_consulta_004", None
 
 
 def conferir(inicio, fim):
-    totais = {"confirmado": 0, "pendente": 0, "erro_consulta_001": 0, "erro_consulta_004": 0}
+    # Carrega todas as paginas do destino antes de classificar pendencias.
+    destino = {}
+    for pedido in listar_pedidos("004", inicio, fim):
+        cabecalho = pedido.get("cabecalho") or {}
+        codigo = str(cabecalho.get("codigo_pedido_integracao") or "").strip()
+        if codigo.endswith("-ATIVA"):
+            destino[codigo] = cabecalho.get("numero_pedido")
+
+    totais = {"confirmado": 0, "pendente": 0, "erro_consulta_001": 0}
+    clientes = {}
     vistos = set()
-    for pedido in consultar_pedidos_origem(inicio, fim):
+    for pedido in listar_pedidos("001", inicio, fim):
         cabecalho = pedido.get("cabecalho") or {}
         if str(cabecalho.get("etapa", "")).strip() not in ETAPAS_GATILHO:
             continue
-        pedido_001 = cabecalho.get("codigo_pedido")
-        if not pedido_001 or not cabecalho.get("codigo_cliente"):
+        codigo_pedido = cabecalho.get("codigo_pedido")
+        codigo_cliente = cabecalho.get("codigo_cliente")
+        numero_001 = cabecalho.get("numero_pedido")
+        if not codigo_pedido or not codigo_cliente:
             totais["erro_consulta_001"] += 1
-            print(json.dumps({"status": "erro_consulta_001", "pedido_001": pedido_001}))
+            print(json.dumps({"status": "erro_consulta_001", "pedido_001": numero_001}))
             continue
-        if pedido_001 in vistos:
+        if codigo_pedido in vistos:
             continue
-        vistos.add(pedido_001)
-        cliente = consultar_cliente_origem(cabecalho["codigo_cliente"])
-        uf = str(cliente.get("estado", "")).strip().upper()
+        vistos.add(codigo_pedido)
+        if codigo_cliente not in clientes:
+            clientes[codigo_cliente] = consultar_omie(
+                OMIE_CLIENTE_URL, "ConsultarCliente", "001", {"codigo_cliente_omie": codigo_cliente},
+            )
+        cliente = clientes[codigo_cliente]
+        uf = str(cliente.get("estado") or "").strip().upper()
+        nome = str(cliente.get("nome_fantasia") or "").strip() or str(cliente.get("razao_social") or "").strip()
+        numero_004 = None
         if not uf:
-            status, pedido_004 = "erro_consulta_001", None
+            status = "erro_consulta_001"
         elif uf not in ESTADOS_PERMITIDOS:
             continue
         else:
-            codigo_base = cabecalho.get("codigo_pedido_integracao") or str(pedido_001)
-            status, pedido_004 = conferir_destino(f"{codigo_base}-ATIVA")
-            time.sleep(0.5)
+            codigo_base = cabecalho.get("codigo_pedido_integracao") or str(codigo_pedido)
+            codigo_destino = f"{codigo_base}-ATIVA".strip()
+            status = "confirmado" if codigo_destino in destino else "pendente"
+            numero_004 = destino.get(codigo_destino)
         totais[status] += 1
-        print(json.dumps({"status": status, "pedido_001": pedido_001, "pedido_004": pedido_004, "uf": uf}))
+        print(json.dumps({
+            "status": status,
+            "pedido_001": numero_001,
+            "cliente": nome or None,
+            "uf": uf,
+            "pedido_004": numero_004,
+        }, ensure_ascii=False))
     print(json.dumps({"inicio": inicio.isoformat(), "fim": fim.isoformat(), **totais}))
     return totais
 
@@ -100,8 +138,12 @@ def main():
     if not ESTADOS_PERMITIDOS:
         parser.error("ESTADOS_PERMITIDOS precisa conter ES, MG ou ambos.")
     fim = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
-    totais = conferir(fim - timedelta(days=args.dias - 1), fim)
-    return int(any(totais[status] for status in ("pendente", "erro_consulta_001", "erro_consulta_004")))
+    try:
+        totais = conferir(fim - timedelta(days=args.dias - 1), fim)
+    except RuntimeError as erro:
+        print(json.dumps({"status": "conferencia_interrompida", "motivo": str(erro)}))
+        return 1
+    return int(any(totais[status] for status in ("pendente", "erro_consulta_001")))
 
 
 if __name__ == "__main__":

@@ -21,14 +21,13 @@ OMIE_PRODUTO_URL = "https://app.omie.com.br/api/v1/geral/produtos/"
 # ==========================================================
 # 2. CONFIGURACOES
 # ==========================================================
-ETAPA_GATILHO        = "10"
 ETAPAS_GATILHO       = {"10", "00"}  # 00 = codigo interno da Omie para Pedido de Venda (etapa 10)
 ETAPA_ENTRADA_DESTINO = "10"
 CATEGORIA_PADRAO      = os.environ.get("CATEGORIA_PADRAO", "1.01.02")
 CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"))
 CODIGO_PARCELA_PADRAO = os.environ.get("CODIGO_PARCELA_PADRAO", "000")
 COOLDOWN_PEDIDO       = int(os.environ.get("COOLDOWN_PEDIDO", "300"))
-ESTADOS_PERMITIDOS    = set(os.environ.get("ESTADOS_PERMITIDOS", "ES,MG").upper().split(","))
+ESTADOS_PERMITIDOS    = {"ES", "MG"} & {uf.strip().upper() for uf in os.environ.get("ESTADOS_PERMITIDOS", "ES,MG").split(",")}
 
 # ==========================================================
 # 3. CONTROLE ANTI-LOOP
@@ -201,7 +200,7 @@ def pedido_ja_existe_na_ativa(codigo_integracao):
     resp = chamar_omie(OMIE_PEDIDO_URL, "ConsultarPedido",
                        APP_KEY_DESTINO, APP_SECRET_DESTINO,
                        {"codigo_pedido_integracao": codigo_integracao})
-    if "pedido_venda_produto" in resp:
+    if resp.get("pedido_venda_produto", resp).get("cabecalho"):
         print(f"Pedido {codigo_integracao} ja existe na ATIVA. Ignorando.")
         return True
     return False
@@ -217,36 +216,46 @@ def transferir_pedido_omie(codigo_pedido_origem):
                         {"codigo_pedido": codigo_pedido_origem})
     if "faultstring" in bruto:
         print(f"Erro ao consultar pedido: {bruto['faultstring']}")
-        return False
+        return "erro"
 
     pedido = bruto.get("pedido_venda_produto", bruto)
     if "cabecalho" not in pedido:
         print("Pedido sem [cabecalho].")
-        return False
+        return "erro"
+
+    cab = pedido["cabecalho"]
+    if str(cab.get("etapa", "")).strip() not in ETAPAS_GATILHO:
+        return "ignorado_etapa"
+
+    # Confirma a UF pelo cliente do pedido na origem, mesmo sem idCliente no evento.
+    id_cliente_origem = cab.get("codigo_cliente")
+    if not id_cliente_origem:
+        print("Pedido sem codigo do cliente na origem.")
+        return "erro"
+    cli = consultar_cliente_origem(id_cliente_origem)
+    if not cli or cli.get("faultstring"):
+        print("Falha ao consultar cliente na origem.")
+        return "erro"
+    estado = str(cli.get("estado", "")).strip().upper()
+    if estado not in ESTADOS_PERMITIDOS:
+        print(f"Pedido {codigo_pedido_origem} ignorado: UF [{estado}] fora da lista.")
+        return "ignorado_estado"
 
     if not pedido.get("det"):
-        print(f"Pedido {codigo_pedido_origem} sem itens. Ignorando.")
-        return True
+        print(f"Pedido {codigo_pedido_origem} ainda sem itens.")
+        return "aguardando_itens"
 
-    # 8.2 Idempotencia
-    cod_int = pedido["cabecalho"].get("codigo_pedido_integracao") or str(codigo_pedido_origem)
+    cod_int = cab.get("codigo_pedido_integracao") or str(codigo_pedido_origem)
     cod_int_destino = f"{cod_int}-ATIVA"
     if pedido_ja_existe_na_ativa(cod_int_destino):
-        return True
-
-    # 8.3 Le e espelha o cliente (estado ja foi verificado no webhook)
-    id_cliente_origem = pedido["cabecalho"].get("codigo_cliente")
-    cli = consultar_cliente_origem(id_cliente_origem)
-    estado = str(cli.get("estado", "")).upper().strip()
-    print(f"Processando pedido de cliente no estado [{estado}]...")
+        return "ja_existe"
 
     id_cliente_destino = espelhar_cliente_destino(cli)
     if not id_cliente_destino:
         print("Nao foi possivel espelhar o cliente.")
-        return False
+        return "erro"
 
     # 8.4 Ajusta cabecalho
-    cab = pedido["cabecalho"]
     cab["codigo_cliente"]            = id_cliente_destino
     cab["codigo_pedido_integracao"]  = cod_int_destino
     cab["etapa"]                     = ETAPA_ENTRADA_DESTINO
@@ -290,7 +299,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
                 prod["codigo_produto"] = id_prod
             else:
                 print(f"ABORTANDO: SKU {sku} nao resolvido nem na FRI nem na ATIVA.")
-                return False
+                return "erro"
         prod.pop("valor_total", None)
 
         inf = item.get("inf_adic", {})
@@ -311,64 +320,66 @@ def transferir_pedido_omie(codigo_pedido_origem):
                       APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido)
     if "codigo_pedido" in res:
         print(f"SUCESSO! Pedido gravado na ATIVA. Novo ID: {res['codigo_pedido']}")
-        return True
+        return "transferido"
 
     print(f"ERRO DO OMIE (ATIVA): {res}")
-    return False
+    return "erro"
 
 
 # ==========================================================
 # 9. WEBHOOK
 # ==========================================================
+@app.route('/webhook', methods=['POST'])
 @app.route('/webhook/omie', methods=['POST'])
 def receber_webhook():
-    payload = request.json
-
-    if payload and payload.get('ping'):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "payload_invalido"}), 400
+    if payload.get('ping'):
         return jsonify({"status": "ok"}), 200
 
-    mensagem    = payload.get('event', {}) if payload else {}
-    print(f"PAYLOAD: topic={payload.get('topic')} etapa={mensagem.get('etapa')} idPedido={mensagem.get('idPedido')} idCliente={mensagem.get('idCliente')}")
-    topic       = str(payload.get('topic', '')).lower() if payload else ''
-    codigo_pedido = mensagem.get('idPedido') or mensagem.get('codigo_pedido')
-    etapa_atual = str(mensagem.get('etapa', ''))
-    id_cliente_webhook = mensagem.get('idCliente')
+    mensagem = payload.get('event')
+    if not isinstance(mensagem, dict):
+        return jsonify({"status": "payload_invalido"}), 400
 
-    eh_inclusao = 'incluido' in topic or 'incluida' in topic
+    topic = str(payload.get('topic', '')).strip().lower()
+    etapa_atual = str(mensagem.get('etapa', '')).strip()
+    eh_inclusao = topic in {'vendaproduto.incluida', 'vendaproduto.incluido'}
+    if not eh_inclusao and (
+        topic != 'vendaproduto.etapaalterada' or etapa_atual not in ETAPAS_GATILHO
+    ):
+        return jsonify({"status": "ignorado"}), 200
 
-    if etapa_atual in ETAPAS_GATILHO or eh_inclusao:
-        # Filtra por estado ANTES de qualquer chamada pesada (ConsultarPedido).
-        # O idCliente ja vem no payload do webhook — apenas ConsultarCliente.
-        if ESTADOS_PERMITIDOS and id_cliente_webhook:
-            cli_check = consultar_cliente_origem(id_cliente_webhook)
-            estado_check = str(cli_check.get("estado", "")).upper().strip()
-            if estado_check not in ESTADOS_PERMITIDOS:
-                print(f"Pedido {codigo_pedido} ignorado: estado [{estado_check}] "
-                      f"fora da lista {ESTADOS_PERMITIDOS}.")
-                return jsonify({"status": "ignorado_estado"}), 200
+    try:
+        codigo_pedido = int(mensagem.get('idPedido') or mensagem.get('codigo_pedido'))
+    except (TypeError, ValueError):
+        return jsonify({"status": "pedido_invalido"}), 400
+    if codigo_pedido <= 0:
+        return jsonify({"status": "pedido_invalido"}), 400
 
-        agora = time.time()
-        with _lock:
-            if codigo_pedido in _pedidos_em_processamento:
-                return jsonify({"status": "em_processamento"}), 200
-            ultimo = _pedidos_ultimo_processo.get(codigo_pedido, 0)
-            if agora - ultimo < COOLDOWN_PEDIDO:
-                restante = int(COOLDOWN_PEDIDO - (agora - ultimo))
-                print(f"Pedido {codigo_pedido} em cooldown ({restante}s).")
-                return jsonify({"status": "cooldown"}), 200
-            _pedidos_em_processamento.add(codigo_pedido)
-            _pedidos_ultimo_processo[codigo_pedido] = agora
+    with _lock:
+        if codigo_pedido in _pedidos_em_processamento:
+            return jsonify({"status": "em_processamento"}), 200
+        ultimo = _pedidos_ultimo_processo.get(codigo_pedido, 0)
+        if time.time() - ultimo < COOLDOWN_PEDIDO:
+            return jsonify({"status": "cooldown"}), 200
+        _pedidos_em_processamento.add(codigo_pedido)
 
-        try:
-            print(f"Transferindo pedido {codigo_pedido} (etapa {etapa_atual} | {topic})...")
-            sucesso = transferir_pedido_omie(codigo_pedido)
-        finally:
+    try:
+        if eh_inclusao:
+            time.sleep(5)
+        print(f"Verificando pedido {codigo_pedido} (etapa {etapa_atual} | {topic})...")
+        status = transferir_pedido_omie(codigo_pedido)
+        if status in {"transferido", "ja_existe"}:
             with _lock:
-                _pedidos_em_processamento.discard(codigo_pedido)
+                _pedidos_ultimo_processo[codigo_pedido] = time.time()
+    finally:
+        with _lock:
+            _pedidos_em_processamento.discard(codigo_pedido)
 
-        return jsonify({"status": "transferido" if sucesso else "erro"}), 200
-
-    return jsonify({"status": "ignorado"}), 200
+    if status in {"aguardando_itens", "erro"}:
+        return jsonify({"status": status}), 503
+    return jsonify({"status": status}), 200
 
 
 # ==========================================================

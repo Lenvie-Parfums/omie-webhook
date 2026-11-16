@@ -1,3 +1,4 @@
+import hmac
 import json
 import re
 import os
@@ -5,6 +6,7 @@ import time
 import threading
 import requests
 from flask import Flask, request, jsonify
+from portal_ativa import bridge
 
 app = Flask(__name__)
 
@@ -200,11 +202,21 @@ def resolver_produto_ativa(sku):
 # ==========================================================
 # 7. IDEMPOTENCIA
 # ==========================================================
-def pedido_existente_na_ativa(codigo_integracao):
+def pedido_existente_na_ativa(codigo_integracao, exigir_resposta=False):
     resp = chamar_omie(OMIE_PEDIDO_URL, "ConsultarPedido",
                        APP_KEY_DESTINO, APP_SECRET_DESTINO,
                        {"codigo_pedido_integracao": codigo_integracao})
-    return resp.get("pedido_venda_produto", resp).get("cabecalho")
+    pedido = resp.get("pedido_venda_produto", resp).get("cabecalho")
+    if exigir_resposta and not pedido:
+        falha = str(resp.get("faultstring") or "")
+        ausencia = re.search(r"\bpedido\b.*\bn[ãa]o (?:encontrad[oa]|cadastrad[oa]|existe|localizad[oa])", falha, re.I)
+        if not ausencia or re.search(r"REDUNDANT|MISUSE_API_PROCESS|bloquead[ao]|limite", falha, re.I):
+            raise ValueError("Nao foi possivel confirmar a ausencia na 004. Nenhuma inclusao foi solicitada.")
+    if exigir_resposta and pedido and (
+        str(pedido.get("codigo_pedido_integracao")) != codigo_integracao or not pedido.get("codigo_pedido")
+    ):
+        raise ValueError("A Omie 004 retornou outro pedido. Nenhuma inclusao foi solicitada.")
+    return pedido
 
 
 # ==========================================================
@@ -385,12 +397,16 @@ def preparar_dados_destino(pedido, mapa):
                     inf.setdefault(campo, CATEGORIA_PADRAO)
 
 
-def transferir_pedido_omie(codigo_pedido_origem):
+def transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
+    if audit is None:
+        audit = {}
+    audit["detail"] = "A Omie nao confirmou a integracao."
     # 8.1 Consulta na FRI
     bruto = chamar_omie(OMIE_PEDIDO_URL, "ConsultarPedido",
                         APP_KEY_ORIGEM, APP_SECRET_ORIGEM,
                         {"codigo_pedido": codigo_pedido_origem})
     if "faultstring" in bruto:
+        audit["detail"] = f"Consulta na 001: {bruto['faultstring']}"
         print(f"Erro ao consultar pedido: {bruto['faultstring']}")
         return "erro"
 
@@ -400,7 +416,9 @@ def transferir_pedido_omie(codigo_pedido_origem):
         return "erro"
 
     cab = pedido["cabecalho"]
+    audit["number"] = cab.get("numero_pedido")
     if str(cab.get("etapa", "")).strip() not in ETAPAS_GATILHO:
+        audit["detail"] = "Pedido fora da etapa 10/00 na 001."
         return "ignorado_etapa"
 
     # Confirma a UF pelo cliente do pedido na origem, mesmo sem idCliente no evento.
@@ -417,19 +435,26 @@ def transferir_pedido_omie(codigo_pedido_origem):
     numero_001 = cab.get("numero_pedido") or "(numero indisponivel)"
     identificacao = f"Pedido 001 {numero_001} | Cliente: {nome or '(nome indisponivel)'} | UF: {estado}"
     if estado not in ESTADOS_PERMITIDOS:
+        audit["detail"] = "UF fora da lista ES/MG."
         print(f"{identificacao} | Ignorado: UF fora da lista.")
         return "ignorado_estado"
 
     if not pedido.get("det"):
+        audit["detail"] = "Pedido ainda sem itens na 001."
         print(f"{identificacao} | Aguardando itens.")
         return "aguardando_itens"
 
     cod_int = cab.get("codigo_pedido_integracao") or str(codigo_pedido_origem)
     cod_int_destino = f"{cod_int}-ATIVA"
-    pedido_existente = pedido_existente_na_ativa(cod_int_destino)
+    try:
+        pedido_existente = pedido_existente_na_ativa(cod_int_destino, exigir_resposta=reenvio)
+    except ValueError as erro:
+        audit["detail"] = str(erro)
+        return "erro"
     if pedido_existente:
         numero_004 = pedido_existente.get("numero_pedido")
         destino = f"Pedido 004 {numero_004}" if numero_004 else "Pedido na 004"
+        audit.update(destination=numero_004, detail="Pedido ja existente na 004.")
         print(f"{identificacao} | {destino} ja existe.")
         return "ja_existe"
 
@@ -439,6 +464,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
             raise ValueError("OMIE_DE_PARA_004 precisa conter grupos de codigos origem/destino.")
         preparar_dados_destino(pedido, mapa)
     except (ValueError, TypeError, AttributeError) as erro:
+        audit["detail"] = f"Dados de destino: {erro}"
         print(f"{identificacao} | Dados de destino inconsistentes: {erro}")
         return "erro"
 
@@ -446,6 +472,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
 
     id_cliente_destino = espelhar_cliente_destino(cli)
     if not id_cliente_destino:
+        audit["detail"] = "Nao foi possivel espelhar o cliente na 004."
         print(f"{identificacao} | Nao foi possivel espelhar o cliente.")
         return "erro"
 
@@ -471,6 +498,7 @@ def transferir_pedido_omie(codigo_pedido_origem):
             if id_prod:
                 prod["codigo_produto"] = id_prod
             else:
+                audit["detail"] = f"SKU {sku} sem cadastro correspondente."
                 print(f"{identificacao} | SKU {sku} nao resolvido na FRI ou na ATIVA.")
                 return "erro"
         prod.pop("valor_total", None)
@@ -486,12 +514,14 @@ def transferir_pedido_omie(codigo_pedido_origem):
     # 8.7 Inclui na ATIVA
     res = chamar_omie(OMIE_PEDIDO_URL, "IncluirPedido",
                       APP_KEY_DESTINO, APP_SECRET_DESTINO, pedido)
-    if "codigo_pedido" in res:
+    if res.get("codigo_pedido") and not res.get("faultstring"):
         numero_004 = res.get("numero_pedido")
         destino = f"Pedido 004 {numero_004}" if numero_004 else "Pedido na 004"
+        audit.update(destination=numero_004, detail="Pedido criado na 004.")
         print(f"{identificacao} | {destino} criado.")
         return "transferido"
 
+    audit["detail"] = f"IncluirPedido na 004: {res.get('faultstring') or 'resposta sem confirmacao'}"
     print(f"{identificacao} | Erro na 004: {res.get('faultstring') or 'resposta sem confirmacao'}")
     return "erro"
 
@@ -539,7 +569,8 @@ def receber_webhook():
         if eh_inclusao:
             time.sleep(5)
         print(f"Verificando pedido {codigo_pedido} (etapa {etapa_atual} | {topic})...")
-        status = transferir_pedido_omie(codigo_pedido)
+        audit = {}
+        status = transferir_pedido_omie(codigo_pedido, audit)
         if status in {"transferido", "ja_existe"}:
             with _lock:
                 _pedidos_ultimo_processo[codigo_pedido] = time.time()
@@ -547,6 +578,14 @@ def receber_webhook():
         with _lock:
             _pedidos_em_processamento.discard(codigo_pedido)
 
+    if status in {"aguardando_itens", "erro", "transferido", "ja_existe"}:
+        try:
+            bridge("event", {
+                **audit, "order_id": str(codigo_pedido),
+                "state": "confirmed" if status in {"transferido", "ja_existe"} else "error",
+            }, timeout=3)
+        except (requests.RequestException, ValueError):
+            print("Nao foi possivel publicar a tentativa no portal.")
     if status in {"aguardando_itens", "erro"}:
         return jsonify({"status": status}), 503
     return jsonify({"status": status}), 200
@@ -555,6 +594,35 @@ def receber_webhook():
 # ==========================================================
 # 10. ROTAS AUXILIARES
 # ==========================================================
+@app.route('/portal/ativa/reenviar', methods=['POST'])
+def reenviar_pedido_portal():
+    token = os.environ.get("ATIVA_BRIDGE_TOKEN", "").strip()
+    enviado = request.headers.get("Authorization", "")
+    if not token or not hmac.compare_digest(enviado.encode(), f"Bearer {token}".encode()):
+        return jsonify({"detail": "Acesso nao autorizado."}), 401
+    body = request.get_json(silent=True)
+    codigo = str(body.get("order_id", "")) if isinstance(body, dict) else ""
+    if not re.fullmatch(r"[1-9][0-9]{0,17}", codigo):
+        return jsonify({"detail": "Pedido invalido."}), 422
+    codigo_pedido = int(codigo)
+    with _lock:
+        if codigo_pedido in _pedidos_em_processamento:
+            return jsonify({"detail": "Pedido em processamento pelo webhook."}), 409
+        if time.time() - _pedidos_ultimo_processo.get(codigo_pedido, 0) < COOLDOWN_PEDIDO:
+            return jsonify({"detail": "Pedido processado recentemente. Aguarde a conferencia."}), 409
+        _pedidos_em_processamento.add(codigo_pedido)
+    try:
+        audit = {}
+        status = transferir_pedido_omie(codigo_pedido, audit, reenvio=True)
+        if status in {"transferido", "ja_existe"}:
+            with _lock:
+                _pedidos_ultimo_processo[codigo_pedido] = time.time()
+        return jsonify({"status": status, **audit})
+    finally:
+        with _lock:
+            _pedidos_em_processamento.discard(codigo_pedido)
+
+
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
     return jsonify({"status": "online", "cache_produtos": len(_cache_produtos)}), 200

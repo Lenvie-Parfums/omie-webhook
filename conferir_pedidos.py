@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from app import ESTADOS_PERMITIDOS, ETAPAS_GATILHO, OMIE_CLIENTE_URL, OMIE_PEDIDO_URL
+from portal_ativa import bridge
 
 
 INTERVALO_API = 1.1
@@ -70,7 +71,7 @@ def listar_pedidos(empresa, inicio, fim):
         pagina += 1
 
 
-def conferir(inicio, fim):
+def conferir(inicio, fim, relatorio=None):
     # Carrega todas as paginas do destino antes de classificar pendencias.
     destino = {}
     for pedido in listar_pedidos("004", inicio, fim):
@@ -90,6 +91,8 @@ def conferir(inicio, fim):
         codigo_cliente = cabecalho.get("codigo_cliente")
         numero_001 = cabecalho.get("numero_pedido")
         if not codigo_pedido or not codigo_cliente:
+            if codigo_pedido and relatorio is not None:
+                relatorio.append({"id": str(codigo_pedido), "number": numero_001, "uf": "", "status": "erro_consulta_001"})
             totais["erro_consulta_001"] += 1
             print(json.dumps({"status": "erro_consulta_001", "pedido_001": numero_001}))
             continue
@@ -114,6 +117,11 @@ def conferir(inicio, fim):
             status = "confirmado" if codigo_destino in destino else "pendente"
             numero_004 = destino.get(codigo_destino)
         totais[status] += 1
+        if relatorio is not None:
+            relatorio.append({
+                "id": str(codigo_pedido), "number": numero_001, "customer": nome,
+                "uf": uf, "destination": numero_004, "status": status,
+            })
         print(json.dumps({
             "status": status,
             "pedido_001": numero_001,
@@ -123,6 +131,34 @@ def conferir(inicio, fim):
         }, ensure_ascii=False))
     print(json.dumps({"inicio": inicio.isoformat(), "fim": fim.isoformat(), **totais}))
     return totais
+
+
+def processar_reenvio(relatorio):
+    resposta = bridge("claim", {})
+    chamado = resposta.get("claim") if resposta else None
+    if not chamado:
+        return
+    resultado = {"id": chamado["id"], "state": "error"}
+    pedido = next((row for row in relatorio if row["id"] == chamado["order_id"]), None)
+    if pedido and pedido["status"] == "confirmado":
+        resultado.update(state="confirmed", destination=pedido["destination"], detail="Copia ja encontrada na 004.")
+    elif not pedido or pedido["status"] != "pendente":
+        resultado["detail"] = "Pedido nao confirmado como elegivel e pendente na nova conferencia."
+    else:
+        try:
+            resposta = requests.post(
+                "https://replicador-pedidos-ativa.onrender.com/portal/ativa/reenviar",
+                json={"order_id": chamado["order_id"]},
+                headers={"Authorization": f"Bearer {os.environ['ATIVA_BRIDGE_TOKEN'].strip()}"},
+                timeout=240,
+            )
+            dados = resposta.json()
+            if dados.get("status") in {"transferido", "ja_existe"} and resposta.ok:
+                resultado.update(state="confirmed", destination=dados.get("destination"))
+            resultado["detail"] = dados.get("detail") or "O serviço não confirmou o reenvio."
+        except (requests.RequestException, ValueError, AttributeError):
+            resultado["detail"] = "Resposta inconclusiva. Confira se a copia existe antes de reenviar."
+    bridge("result", resultado)
 
 
 def main():
@@ -138,10 +174,21 @@ def main():
     if not ESTADOS_PERMITIDOS:
         parser.error("ESTADOS_PERMITIDOS precisa conter ES, MG ou ambos.")
     fim = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    relatorio = []
     try:
-        totais = conferir(fim - timedelta(days=args.dias - 1), fim)
+        totais = conferir(fim - timedelta(days=args.dias - 1), fim, relatorio)
     except RuntimeError as erro:
         print(json.dumps({"status": "conferencia_interrompida", "motivo": str(erro)}))
+        try:
+            bridge("report", {"error": str(erro)})
+        except (requests.RequestException, ValueError):
+            print("Falha ao enviar o status da conferencia ao portal.")
+        return 1
+    try:
+        if bridge("report", {"rows": relatorio}):
+            processar_reenvio(relatorio)
+    except (requests.RequestException, ValueError):
+        print("Falha na comunicacao entre a conferencia e o portal.")
         return 1
     return int(any(totais[status] for status in ("pendente", "erro_consulta_001")))
 

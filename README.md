@@ -45,3 +45,18 @@ Use somente codigos conferidos na 004. A filial conserva a categoria e
 conta corrente padrao quando nao existe de-para. O rateio por departamento
 so e enviado quando todos os departamentos do pedido tem equivalente.
 Pedidos ja existentes na 004 continuam protegidos contra nova inclusao.
+
+## Envio da conferencia e reenvio pelo portal
+
+Configure `ATIVA_PORTAL_URL` com a URL do portal e `ATIVA_BRIDGE_TOKEN`
+com o mesmo segredo dedicado no Worker Cloudflare, no Cron Job
+`omie-ativa-conferencia` e no Web Service `Replicador-Pedidos-Ativa`.
+O Worker deve receber o segredo antes de ativar o envio. Configure a URL
+nas duas tarefas do Render. Sem essas variaveis a conferencia e o webhook
+continuam rodando com os logs locais, sem trocar dados com o portal.
+
+O Cron Job publica somente a conferencia completa. Se uma consulta falhar,
+a tela conserva o ultimo resultado e sinaliza a falha. Ele processa ate um
+reenvio autorizado por rodada e pede ao replicador para confirmar o pedido
+na ATIVA antes de qualquer nova inclusao. Uma resposta inconclusiva fica
+registrada na tentativa e exige nova verificacao antes de reenviar.

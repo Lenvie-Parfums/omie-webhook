@@ -1,0 +1,16 @@
+services:
+  - type: cron
+    name: omie-ativa-conferencia
+    runtime: python
+    schedule: "7,37 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u conferir_pedidos.py
+    envVars:
+      - key: APP_KEY_ORIGEM
+        sync: false
+      - key: APP_SECRET_ORIGEM
+        sync: false
+      - key: APP_KEY_DESTINO
+        sync: false
+      - key: APP_SECRET_DESTINO
+        sync: false

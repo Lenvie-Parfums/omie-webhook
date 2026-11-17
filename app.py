@@ -311,6 +311,50 @@ def mapear_campo(bloco, campo, mapa, grupo):
         bloco[campo] = codigo_destino
 
 
+def limpar_observacao_lote(texto):
+    if not isinstance(texto, str):
+        return texto
+    data = r"[0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4}"
+    formato_lote = re.compile(rf"L[0-9][A-Z0-9.-]*\s+{data}\s+{data}", re.I)
+    rotulo_lote = re.compile(
+        r"^(?:lote|validade|fabrica[çc][ãa]o|data de validade|data de fabrica[çc][ãa]o)\s*[:=]",
+        re.I,
+    )
+    linhas = []
+    for linha in texto.splitlines(keepends=True):
+        partes = re.split(r"\s*\|\s*", linha.rstrip("\r\n"))
+        restantes = [parte for parte in partes
+                     if not formato_lote.fullmatch(parte.strip()) and not rotulo_lote.match(parte.strip())]
+        if len(restantes) == len(partes):
+            linhas.append(linha)
+        elif any(parte.strip() for parte in restantes):
+            linhas.append(" | ".join(restantes) + linha[len(linha.rstrip("\r\n")):])
+    return "".join(linhas)
+
+
+def retirar_lote_do_item(item):
+    item.pop("rastreabilidade", None)
+    item.pop("lote_validade", None)
+    observacao = item.get("observacao")
+    for bloco in (item, observacao):
+        if not isinstance(bloco, dict) or "obs_item" not in bloco:
+            continue
+        valor = bloco["obs_item"]
+        if isinstance(valor, dict):
+            valor = {campo: texto for campo, texto in valor.items() if campo not in {
+                "codigo_lote", "lote", "validade", "fabricacao", "data_validade",
+                "data_fabricacao", "numeroLote", "dataValidadeLote", "dataFabricacaoLote",
+            }}
+        else:
+            valor = limpar_observacao_lote(valor)
+        if valor:
+            bloco["obs_item"] = valor
+        else:
+            bloco.pop("obs_item", None)
+    if isinstance(observacao, dict) and not observacao:
+        item.pop("observacao", None)
+
+
 def preparar_dados_destino(pedido, mapa):
     cab = pedido["cabecalho"]
     codigo_parcela = str(cab.get("codigo_parcela") or "").strip()
@@ -360,9 +404,12 @@ def preparar_dados_destino(pedido, mapa):
     if codigo_transportadora and not frete.get("codigo_transportadora"):
         frete["codigo_transportadora"] = codigo_transportadora
     mapear_cadastro(pedido, frete, "codigo_transportadora", mapa, "transportadoras", "Transportadora")
-    frete.pop("codigo_transportadora_integracao", None)
+    for campo in ("codigo_transportadora_integracao", "quantidade_volumes", "especie_volumes"):
+        frete.pop(campo, None)
     if frete:
         pedido["frete"] = frete
+    else:
+        pedido.pop("frete", None)
 
     adicionais = pedido.get("informacoes_adicionais")
     if not isinstance(adicionais, dict):
@@ -503,9 +550,8 @@ def transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
                 return "erro"
         prod.pop("valor_total", None)
 
-        # Preserva obs_item (contem lote/fabricacao/validade da FRI)
-        # para o webhook-rastreabilidade nao cancelar o pedido no destino.
-        # O obs_item ja vem no item original e nao e removido.
+        # A ATIVA informa os lotes e a validade apos a separacao.
+        retirar_lote_do_item(item)
 
     # 8.6 Remove blocos calculados
     for chave in ("infoCadastro", "total_pedido"):

@@ -1,5 +1,31 @@
 # omie-webhook
 
+## Fila automatica do portal (sem confirmacao manual no Render)
+
+O Web Service consome automaticamente as solicitacoes explicitamente colocadas
+na fila do portal. Nao depende mais de concluir a conferencia de todos os pedidos.
+A fila vazia consulta somente o portal a cada 30 segundos, sem chamar a Omie.
+O endpoint autenticado `POST /portal/ativa/processar-fila` antecipa essa verificacao
+quando o portal registra um novo reenvio. Ele responde 202, nao uma confirmacao de inclusao.
+
+Use `ATIVA_PORTAL_URL` e `ATIVA_BRIDGE_TOKEN` ja configurados no Web Service.
+`ATIVA_QUEUE_ENABLED=0` desativa o consumidor, se necessario. O Gunicorn inicia
+o consumidor em `post_worker_init`; existe tambem inicializacao na primeira
+requisicao para outros comandos de inicio. Nenhum novo servico pago e criado.
+
+Cada tentativa confere a ausencia na 004 antes de incluir, usa o codigo
+de integracao com sufixo `-ATIVA` e publica erro ou confirmacao com o numero
+de destino. Se o retorno ao portal falhar, repete somente a entrega do retorno,
+nunca a inclusao. Uma falha de negocio exige corrigir o motivo e solicitar nova
+tentativa no portal. A conferencia periodica continua como verificacao adicional.
+
+As transferencias deste processo sao sequenciais. Chamadas Omie deste processo
+tem intervalo minimo de 1,1 segundo; leituras identicas aguardam 30 segundos.
+Outros processos e integracoes com a mesma chave precisam respeitar os limites
+tambem: esse controle local nao representa um limite global de todos os consumidores.
+
+Validacao local, sem chamadas reais: `python -m unittest -v test_fila_portal.py`.
+
 ## Conferencia dos pedidos 001 para 004
 
 O Cron Job separado do webhook esta definido em `render.yaml`. No Render,

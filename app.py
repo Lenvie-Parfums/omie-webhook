@@ -246,7 +246,7 @@ def pedido_existente_na_ativa(codigo_integracao, exigir_resposta=False):
 # 8. TRANSFERENCIA DO PEDIDO
 # ==========================================================
 def consultar_referencia(url, chamada, key, secret, parametros, aceitar_vazio=False):
-    time.sleep(1.1)
+    # chamar_omie already enforces the interval across all service calls.
     resposta = chamar_omie(url, chamada, key, secret, parametros)
     falha = resposta.get("faultstring")
     if aceitar_vazio and falha and re.fullmatch(

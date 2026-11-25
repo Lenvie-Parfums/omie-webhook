@@ -7,6 +7,7 @@ import threading
 import requests
 from flask import Flask, request, jsonify
 from portal_ativa import bridge
+from fila_portal import PortalQueue
 
 app = Flask(__name__)
 
@@ -40,6 +41,10 @@ ESTADOS_PERMITIDOS    = {"ES", "MG"} & {uf.strip().upper() for uf in os.environ.
 _pedidos_em_processamento = set()
 _pedidos_ultimo_processo  = {}
 _lock = threading.Lock()
+_transfer_lock = threading.Lock()
+_omie_lock = threading.Lock()
+_omie_last_call = 0.0
+_omie_read_calls = {}
 
 # Cache de produtos em memoria: SKU -> codigo_produto da ATIVA
 # Preenchido na primeira vez que cada SKU e consultado.
@@ -53,8 +58,26 @@ _cache_clientes = {}  # codigo_cliente_omie -> dict completo do cliente
 # ==========================================================
 def chamar_omie(url, call, app_key, app_secret, param):
     payload = {"call": call, "app_key": app_key, "app_secret": app_secret, "param": [param]}
+    global _omie_last_call
     try:
-        resp = requests.post(url, json=payload, timeout=60).json()
+        # Serialize this service's API traffic; identical reads wait 30 seconds.
+        read_key = (url, call, app_key, json.dumps(param, sort_keys=True)) if call.startswith(("Consultar", "Listar")) else None
+        with _omie_lock:
+            now = time.monotonic()
+            wait = max(0, 1.1 - (now - _omie_last_call))
+            if read_key in _omie_read_calls:
+                wait = max(wait, 30 - (now - _omie_read_calls[read_key]))
+            if wait:
+                time.sleep(wait)
+            called_at = time.monotonic()
+            _omie_last_call = called_at
+            if read_key is not None:
+                _omie_read_calls[read_key] = called_at
+            if len(_omie_read_calls) > 5000:
+                expired = [k for k, at in _omie_read_calls.items() if called_at - at > 60]
+                for k in expired:
+                    _omie_read_calls.pop(k, None)
+            resp = requests.post(url, json=payload, timeout=60).json()
     except Exception as e:
         print(f"Falha de rede em {call}: {e}")
         return {"faultstring": str(e)}
@@ -445,6 +468,11 @@ def preparar_dados_destino(pedido, mapa):
 
 
 def transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
+    with _transfer_lock:
+        return _transferir_pedido_omie(codigo_pedido_origem, audit, reenvio)
+
+
+def _transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
     if audit is None:
         audit = {}
     audit["detail"] = "A Omie nao confirmou a integracao."
@@ -650,12 +678,17 @@ def reenviar_pedido_portal():
     codigo = str(body.get("order_id", "")) if isinstance(body, dict) else ""
     if not re.fullmatch(r"[1-9][0-9]{0,17}", codigo):
         return jsonify({"detail": "Pedido invalido."}), 422
+    body, status_code = processar_pedido_portal(codigo)
+    return jsonify(body), status_code
+
+
+def processar_pedido_portal(codigo):
     codigo_pedido = int(codigo)
     with _lock:
         if codigo_pedido in _pedidos_em_processamento:
-            return jsonify({"detail": "Pedido em processamento pelo webhook."}), 409
+            return {"detail": "Pedido em processamento pelo webhook."}, 409
         if time.time() - _pedidos_ultimo_processo.get(codigo_pedido, 0) < COOLDOWN_PEDIDO:
-            return jsonify({"detail": "Pedido processado recentemente. Aguarde a conferencia."}), 409
+            return {"detail": "Pedido processado recentemente. Confira na 004."}, 409
         _pedidos_em_processamento.add(codigo_pedido)
     try:
         audit = {}
@@ -663,15 +696,50 @@ def reenviar_pedido_portal():
         if status in {"transferido", "ja_existe"}:
             with _lock:
                 _pedidos_ultimo_processo[codigo_pedido] = time.time()
-        return jsonify({"status": status, **audit})
+        return {"status": status, **audit}, 200
     finally:
         with _lock:
             _pedidos_em_processamento.discard(codigo_pedido)
 
 
+_portal_queue = None
+_queue_start_lock = threading.Lock()
+
+
+def start_portal_queue():
+    global _portal_queue
+    if os.environ.get("ATIVA_QUEUE_ENABLED", "1") == "0":
+        return None
+    if not os.environ.get("ATIVA_PORTAL_URL", "").strip() or not os.environ.get("ATIVA_BRIDGE_TOKEN", "").strip():
+        return None
+    with _queue_start_lock:
+        if _portal_queue is None:
+            _portal_queue = PortalQueue(bridge, processar_pedido_portal)
+        _portal_queue.start()
+        return _portal_queue
+
+
+@app.before_request
+def ensure_portal_queue():
+    # Also supports Render start commands that don't load gunicorn.conf.py.
+    start_portal_queue()
+
+
+@app.route('/portal/ativa/processar-fila', methods=['POST'])
+def sinalizar_fila_portal():
+    token = os.environ.get("ATIVA_BRIDGE_TOKEN", "").strip()
+    if not token or not hmac.compare_digest(request.headers.get("Authorization", "").encode(), f"Bearer {token}".encode()):
+        return jsonify({"detail": "Acesso nao autorizado."}), 401
+    queue = start_portal_queue()
+    if queue is None:
+        return jsonify({"detail": "Fila automatica sem configuracao."}), 503
+    queue.notify()
+    return jsonify({"status": "queued", "queue": queue.status()}), 202
+
+
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
-    return jsonify({"status": "online", "cache_produtos": len(_cache_produtos)}), 200
+    return jsonify({"status": "online", "cache_produtos": len(_cache_produtos), "portal_queue": _portal_queue.status() if _portal_queue else {"running": False}}), 200
 
 
 @app.route('/categorias', methods=['GET'])

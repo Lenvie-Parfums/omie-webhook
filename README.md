@@ -74,6 +74,16 @@ Pedidos ja existentes na 004 continuam protegidos contra nova inclusao.
 
 ## Envio da conferencia e reenvio pelo portal
 
+O `gunicorn.conf.py` usa um processo com quatro threads (`gthread`). Isso
+mantem o heartbeat do processo e as rotas de saude/sinalizacao disponiveis
+durante consultas demoradas ao Omie. O modo `sync` encerrava o processo apos
+120 segundos de um webhook, interrompendo tambem a fila e apagando caches.
+Os locks de transferencia e de chamadas Omie continuam serializando as
+operacoes; quatro threads HTTP nao significam quatro inclusoes simultaneas.
+O comando existente do Render carrega este arquivo automaticamente a partir
+da raiz. Nao acrescente `--worker-class sync`. As pausas de consulta sao
+centralizadas em `chamar_omie`, sem pausa duplicada em referencias.
+
 Configure `ATIVA_PORTAL_URL` com a URL do portal e `ATIVA_BRIDGE_TOKEN`
 com o mesmo segredo dedicado no Worker Cloudflare, no Cron Job
 `omie-ativa-conferencia` e no Web Service `Replicador-Pedidos-Ativa`.

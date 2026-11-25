@@ -6,6 +6,44 @@ from fila_portal import PortalQueue
 
 
 class QueueTests(unittest.TestCase):
+    def test_gunicorn_uses_threads_so_slow_webhook_cannot_kill_queue(self):
+        import runpy
+        from pathlib import Path
+        config = runpy.run_path(str(Path(__file__).with_name('gunicorn.conf.py')))
+        self.assertEqual(config['worker_class'], 'gthread')
+        self.assertEqual(config['workers'], 1)
+        self.assertGreaterEqual(config['threads'], 4)
+
+    def test_health_and_queue_signal_remain_available_during_slow_webhook(self):
+        import app
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        def slow_transfer(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return 'ignorado_estado'
+        def webhook():
+            with app.app.test_client() as client:
+                client.post('/webhook/omie', json={'topic': 'vendaproduto.etapaalterada', 'event': {'idPedido': 888, 'etapa': '10'}})
+        with patch.object(app, 'transferir_pedido_omie', side_effect=slow_transfer), patch.object(app, 'start_portal_queue', return_value=Mock(status=Mock(return_value={'running': True}))), patch.dict(os.environ, {'ATIVA_BRIDGE_TOKEN': 'test-secret'}):
+            thread = threading.Thread(target=webhook)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                with app.app.test_client() as client:
+                    self.assertEqual(client.get('/').status_code, 200)
+                    self.assertEqual(client.post('/portal/ativa/processar-fila', headers={'Authorization': 'Bearer test-secret'}).status_code, 202)
+            finally:
+                release.set()
+                thread.join(3)
+
+    def test_reference_lookup_uses_central_throttle_without_extra_sleep(self):
+        import app
+        with patch.object(app, 'chamar_omie', return_value={'codigo': 1}) as call, patch.object(app.time, 'sleep') as sleep:
+            self.assertEqual(app.consultar_referencia('url', 'ConsultarVendedor', 'key', 'secret', {}), {'codigo': 1})
+            call.assert_called_once()
+            sleep.assert_not_called()
+
     def test_repeated_read_waits_30_seconds_but_distinct_reads_only_use_base_interval(self):
         import app
         clock = [100.0]

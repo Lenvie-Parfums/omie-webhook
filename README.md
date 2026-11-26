@@ -35,6 +35,9 @@ credenciais das duas empresas. A rotina roda aos minutos 07 e 37 de cada hora.
 Ela consulta pedidos emitidos nos ultimos sete dias corridos (incluindo hoje,
 no horario de Brasilia) que estao na etapa 10/00 da 001 e verifica a UF do
 cadastro. Para ES e MG, procura a copia pelo codigo com sufixo `-ATIVA`.
+Clientes da lista `CLIENTES_EXCLUIDOS` (padrao: MAXMIX, ESTOK, VIVARA, CIELLE,
+buscados no nome fantasia e na razao social, sem diferenciar acento, espaco ou
+pontuacao) nao sao replicados pelo webhook nem contam como pendencia aqui.
 Nos logs de Runs, cada linha mostra o status, o nome do cliente, a UF e os
 numeros dos pedidos. Uma pendencia indica que a copia nao apareceu na listagem
 da 004 dentro do periodo consultado. A rotina pagina as duas listagens, cacheia

@@ -4,6 +4,7 @@ import re
 import os
 import time
 import threading
+import unicodedata
 import requests
 from flask import Flask, request, jsonify
 from portal_ativa import bridge
@@ -34,6 +35,25 @@ CONTA_CORRENTE_PADRAO = int(os.environ.get("CONTA_CORRENTE_PADRAO", "6760726795"
 CODIGO_PARCELA_PADRAO = os.environ.get("CODIGO_PARCELA_PADRAO", "000")
 COOLDOWN_PEDIDO       = int(os.environ.get("COOLDOWN_PEDIDO", "300"))
 ESTADOS_PERMITIDOS    = {"ES", "MG"} & {uf.strip().upper() for uf in os.environ.get("ESTADOS_PERMITIDOS", "ES,MG").split(",")}
+
+
+def _compactar_nome(texto):
+    # Maiusculas sem acento, espaco ou pontuacao: "Max Mix Ltda." -> "MAXMIXLTDA"
+    texto = unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Z0-9]", "", texto.upper())
+
+
+# Clientes ES/MG que nao devem ser replicados para a 004 (busca no nome fantasia e na razao social).
+CLIENTES_EXCLUIDOS = tuple(filter(None, (
+    _compactar_nome(nome) for nome in os.environ.get("CLIENTES_EXCLUIDOS", "MAXMIX,ESTOK,VIVARA,CIELLE").split(",")
+)))
+
+
+def cliente_excluido(cliente):
+    """Retorna o nome da lista de exclusao encontrado no cadastro do cliente, ou None."""
+    nomes = " ".join(str(cliente.get(campo) or "") for campo in ("nome_fantasia", "razao_social"))
+    compacto = _compactar_nome(nomes)
+    return next((nome for nome in CLIENTES_EXCLUIDOS if nome in compacto), None)
 
 # ==========================================================
 # 3. CONTROLE ANTI-LOOP
@@ -513,6 +533,12 @@ def _transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
         audit["detail"] = "UF fora da lista ES/MG."
         print(f"{identificacao} | Ignorado: UF fora da lista.")
         return "ignorado_estado"
+
+    excluido = cliente_excluido(cli)
+    if excluido:
+        audit["detail"] = f"Cliente na lista de exclusao ({excluido})."
+        print(f"{identificacao} | Ignorado: cliente na lista de exclusao ({excluido}).")
+        return "ignorado_cliente"
 
     if not pedido.get("det"):
         audit["detail"] = "Pedido ainda sem itens na 001."

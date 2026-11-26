@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from app import ESTADOS_PERMITIDOS, ETAPAS_GATILHO, OMIE_CLIENTE_URL, OMIE_PEDIDO_URL
+from app import ESTADOS_PERMITIDOS, ETAPAS_GATILHO, OMIE_CLIENTE_URL, OMIE_PEDIDO_URL, cliente_excluido
 from portal_ativa import bridge
 
 
@@ -109,7 +109,7 @@ def conferir(inicio, fim, relatorio=None):
         numero_004 = None
         if not uf:
             status = "erro_consulta_001"
-        elif uf not in ESTADOS_PERMITIDOS:
+        elif uf not in ESTADOS_PERMITIDOS or cliente_excluido(cliente):
             continue
         else:
             codigo_base = cabecalho.get("codigo_pedido_integracao") or str(codigo_pedido)

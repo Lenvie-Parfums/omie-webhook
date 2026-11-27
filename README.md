@@ -60,6 +60,15 @@ CNPJ/CPF, respectivamente. Quando o cadastro nao tem correspondencia unica,
 o nome de origem fica nas observacoes do pedido. As consultas de cadastro
 sao sequenciais e os resultados ficam em cache.
 
+Se o CNPJ exato da transportadora nao tem cadastro ativo na 004 (por exemplo,
+outra filial da ATIVA inativa na 004), a replicacao procura pela raiz do CNPJ
+(8 primeiros digitos) entre os cadastros ativos da 004. Usa o cadastro somente
+quando ele e unico; havendo mais de um, fica apenas o marcado como Transportadora.
+Sem resultado unico, o comportamento anterior se mantem (nome nas observacoes).
+A lista de clientes da 004 e lida so nesse caso, paginada, com cache de 1 hora
+e limite de 30 paginas; uma falha nessa leitura nao bloqueia o pedido.
+Validacao local: `python -m unittest -v test_transportadora_raiz.py`.
+
 O valor opcional de `OMIE_DE_PARA_004` e um objeto JSON indexado por grupo
 e codigo de origem. Os grupos aceitos sao `parcelas`, `vendedores`,
 `transportadoras`, `categorias`, `contas_correntes`, `projetos`,

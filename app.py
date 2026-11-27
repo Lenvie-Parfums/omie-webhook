@@ -308,7 +308,10 @@ def resolver_referencia(grupo, codigo):
         nome = str(origem.get("nome") or "").strip()
         email = str(origem.get("email") or "").strip().casefold()
         if not nome:
-            raise ValueError("Vendedor sem nome na 001.")
+            # Cadastro incompleto na 001 nao impede o pedido: segue sem vendedor.
+            print("Vendedor sem nome na 001; pedido segue sem vendedor.")
+            _cache_referencias[chave] = (agora + 300, (None, ""))
+            return None, ""
         resposta = consultar_referencia(
             OMIE_VENDEDOR_URL, "ListarVendedores", APP_KEY_DESTINO, APP_SECRET_DESTINO,
             {"pagina": 1, "registros_por_pagina": 100, "filtrar_por_nome": nome},
@@ -328,7 +331,11 @@ def resolver_referencia(grupo, codigo):
         nome = str(origem.get("razao_social") or origem.get("nome_fantasia") or "").strip()
         documento = re.sub(r"[^A-Za-z0-9]", "", str(origem.get("cnpj_cpf") or ""))
         if not documento:
-            raise ValueError("Transportadora sem CNPJ/CPF na 001.")
+            # Sem CNPJ/CPF nao ha como achar o cadastro na 004: segue sem transportadora,
+            # com o nome nas observacoes do pedido.
+            print("Transportadora sem CNPJ/CPF na 001; pedido segue sem transportadora.")
+            _cache_referencias[chave] = (agora + 300, (None, nome))
+            return None, nome
         resposta = consultar_referencia(
             OMIE_CLIENTE_URL, "ListarClientes", APP_KEY_DESTINO, APP_SECRET_DESTINO,
             {"pagina": 1, "registros_por_pagina": 100, "clientesFiltro": {"cnpj_cpf": documento}},

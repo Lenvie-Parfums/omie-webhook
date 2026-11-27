@@ -64,5 +64,24 @@ class ProtecaoWebhookTests(unittest.TestCase):
             self.assertEqual(post.call_count, 2)
 
 
+class CadastroIncompletoTests(unittest.TestCase):
+    def setUp(self):
+        app._cache_referencias.clear()
+
+    def test_transportadora_sem_cnpj_nao_bloqueia_pedido(self):
+        pedido = {"cabecalho": {"codigo_parcela": "000", "qtde_parcelas": 1}, "frete": {"codigo_transportadora": 55}}
+        with patch.object(app, "chamar_omie", return_value={"razao_social": "TRANSPORTE SEM DOC", "cnpj_cpf": ""}) as call:
+            app.preparar_dados_destino(pedido, {})
+        self.assertNotIn("frete", pedido)
+        self.assertIn("Transportadora na 001: TRANSPORTE SEM DOC", pedido["observacoes"]["obs_venda"])
+        call.assert_called_once()
+
+    def test_vendedor_sem_nome_nao_bloqueia_pedido(self):
+        pedido = {"cabecalho": {"codigo_parcela": "000", "qtde_parcelas": 1}, "informacoes_adicionais": {"codVend": 77}}
+        with patch.object(app, "chamar_omie", return_value={"nome": "", "email": ""}):
+            app.preparar_dados_destino(pedido, {})
+        self.assertNotIn("codVend", pedido["informacoes_adicionais"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,8 @@ _omie_read_calls = {}
 _cache_produtos = {}
 _cache_referencias = {}
 _cache_clientes = {}  # codigo_cliente_omie -> dict completo do cliente
+_cache_clientes_destino = {"lista": None, "validade": 0.0}  # CNPJs ativos da 004
+LIMITE_PAGINAS_CLIENTES = 30  # 3.000 cadastros por leitura
 
 
 # ==========================================================
@@ -325,9 +327,61 @@ def resolver_referencia(grupo, codigo):
             and re.sub(r"[^A-Za-z0-9]", "", str(c.get("cnpj_cpf") or "")).upper() == documento.upper()
         ]
 
-    resultado = (candidatos[0] if len(candidatos) == 1 and int(resposta.get("total_de_paginas") or 1) == 1 else None, nome)
+    unico = candidatos[0] if len(candidatos) == 1 and int(resposta.get("total_de_paginas") or 1) == 1 else None
+    if not unico and grupo == "transportadoras" and re.fullmatch(r"\d{14}", documento):
+        unico = transportadora_pela_raiz(documento)
+        if unico:
+            print(f"Transportadora da 001 sem cadastro ativo com o mesmo CNPJ na 004; "
+                  f"usado o unico cadastro ativo da mesma empresa (raiz {documento[:8]}).")
+    resultado = (unico, nome)
     _cache_referencias[chave] = (agora + (3600 if resultado[0] else 300), resultado)
     return resultado
+
+
+def clientes_ativos_destino():
+    """CNPJs ativos da 004 (cache de 1 hora). Retorna None se a leitura falhar ou ficar incompleta."""
+    agora = time.monotonic()
+    if _cache_clientes_destino["lista"] is not None and agora < _cache_clientes_destino["validade"]:
+        return _cache_clientes_destino["lista"]
+    lista, pagina = [], 1
+    try:
+        while True:
+            resposta = consultar_referencia(
+                OMIE_CLIENTE_URL, "ListarClientes", APP_KEY_DESTINO, APP_SECRET_DESTINO,
+                {"pagina": pagina, "registros_por_pagina": 100}, aceitar_vazio=True,
+            )
+            for c in resposta.get("clientes_cadastro", []):
+                documento = re.sub(r"\D", "", str(c.get("cnpj_cpf") or ""))
+                if c.get("codigo_cliente_omie") and c.get("inativo") != "S" and len(documento) == 14:
+                    tags = {
+                        str(t.get("tag") if isinstance(t, dict) else t).strip().casefold()
+                        for t in (c.get("tags") or [])
+                    }
+                    lista.append((documento, c["codigo_cliente_omie"], "transportadora" in tags))
+            total = int(resposta.get("total_de_paginas") or 1)
+            if pagina >= total:
+                break
+            if pagina >= LIMITE_PAGINAS_CLIENTES:
+                print("Lista de clientes da 004 acima do limite de leitura; busca pela raiz do CNPJ ignorada.")
+                return None
+            pagina += 1
+    except (ValueError, TypeError) as erro:
+        print(f"Busca pela raiz do CNPJ indisponivel: {erro}")
+        return None
+    _cache_clientes_destino.update(lista=lista, validade=agora + 3600)
+    return lista
+
+
+def transportadora_pela_raiz(documento):
+    """Unico cadastro ativo da 004 com a mesma raiz de CNPJ (8 primeiros digitos).
+    Havendo mais de um, fica apenas o marcado como Transportadora; sem resultado unico, nao escolhe."""
+    clientes = clientes_ativos_destino()
+    if not clientes:
+        return None
+    mesma_empresa = [c for c in clientes if c[0][:8] == documento[:8]]
+    if len(mesma_empresa) > 1:
+        mesma_empresa = [c for c in mesma_empresa if c[2]]
+    return mesma_empresa[0][1] if len(mesma_empresa) == 1 else None
 
 
 def mapear_cadastro(pedido, bloco, campo, mapa, grupo, rotulo):

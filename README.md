@@ -26,6 +26,16 @@ tambem: esse controle local nao representa um limite global de todos os consumid
 
 Validacao local, sem chamadas reais: `python -m unittest -v test_fila_portal.py`.
 
+## Protecao contra reenvio infinito e bloqueio da Omie
+
+- Pedido que a 001 informa como "nao cadastrado" (excluido ou de outra empresa)
+  responde 200 ao webhook: repetir nao resolve e so consome a cota da Omie.
+- Evento com `appKey` diferente da 001 e ignorado sem chamar a Omie.
+- Quando a Omie informa "API bloqueada por consumo indevido", o processo suspende
+  todas as chamadas pelo prazo informado (mais 30 segundos). Nesse periodo o
+  webhook responde 503 sem consultar a Omie, e a Omie reenvia o evento depois.
+- Validacao local: `python -m unittest -v test_webhook_protecao.py`.
+
 ## Conferencia dos pedidos 001 para 004
 
 O Cron Job separado do webhook esta definido em `render.yaml`. No Render,

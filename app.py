@@ -65,6 +65,8 @@ _transfer_lock = threading.Lock()
 _omie_lock = threading.Lock()
 _omie_last_call = 0.0
 _omie_read_calls = {}
+_omie_bloqueio_ate = 0.0  # time.monotonic() ate o fim do bloqueio informado pela Omie
+PEDIDO_INEXISTENTE = re.compile(r"Pedido n[aã]o cadastrado", re.I)
 
 # Cache de produtos em memoria: SKU -> codigo_produto da ATIVA
 # Preenchido na primeira vez que cada SKU e consultado.
@@ -76,9 +78,18 @@ _cache_clientes = {}  # codigo_cliente_omie -> dict completo do cliente
 # ==========================================================
 # 4. HELPER OMIE
 # ==========================================================
+def bloqueio_restante():
+    """Segundos que faltam no bloqueio da Omie registrado por este processo."""
+    return max(0.0, _omie_bloqueio_ate - time.monotonic())
+
+
 def chamar_omie(url, call, app_key, app_secret, param):
     payload = {"call": call, "app_key": app_key, "app_secret": app_secret, "param": [param]}
-    global _omie_last_call
+    global _omie_last_call, _omie_bloqueio_ate
+    restante = bloqueio_restante()
+    if restante:
+        # Insistir durante o bloqueio prolonga o bloqueio. Nao chama a Omie ate o prazo acabar.
+        return {"faultstring": f"API Omie bloqueada por consumo indevido. Nova tentativa em {int(restante) + 1} segundos (pausa local)."}
     try:
         # Serialize this service's API traffic; identical reads wait 30 seconds.
         read_key = (url, call, app_key, json.dumps(param, sort_keys=True)) if call.startswith(("Consultar", "Listar")) else None
@@ -103,7 +114,11 @@ def chamar_omie(url, call, app_key, app_secret, param):
         return {"faultstring": str(e)}
     fault = str(resp.get("faultstring", "")) if isinstance(resp, dict) else ""
     if "MISUSE_API_PROCESS" in str(resp) or "API bloqueada" in fault:
-        print(f"!!! API OMIE BLOQUEADA em {call}: {fault}")
+        segundos = re.search(r"(\d+)\s*segundos", fault)
+        espera = (int(segundos.group(1)) if segundos else 1800) + 30
+        with _omie_lock:
+            _omie_bloqueio_ate = max(_omie_bloqueio_ate, time.monotonic() + espera)
+        print(f"!!! API OMIE BLOQUEADA em {call}: {fault} Chamadas suspensas por {espera} segundos.")
     elif "REDUNDANT" in str(resp):
         print(f"Consumo redundante em {call}. Aguarde antes de repetir.")
     return resp
@@ -502,6 +517,10 @@ def _transferir_pedido_omie(codigo_pedido_origem, audit=None, reenvio=False):
                         {"codigo_pedido": codigo_pedido_origem})
     if "faultstring" in bruto:
         audit["detail"] = f"Consulta na 001: {bruto['faultstring']}"
+        if PEDIDO_INEXISTENTE.search(str(bruto["faultstring"])):
+            # Pedido excluido ou de outra empresa: repetir nao resolve e so consome a cota da Omie.
+            print(f"Pedido {codigo_pedido_origem} nao existe na 001. Evento descartado, sem nova tentativa.")
+            return "inexistente"
         print(f"Erro ao consultar pedido: {bruto['faultstring']}")
         return "erro"
 
@@ -642,6 +661,12 @@ def receber_webhook():
     if not isinstance(mensagem, dict):
         return jsonify({"status": "payload_invalido"}), 400
 
+    # Eventos de outro aplicativo Omie (ex.: a propria 004) nao sao pedidos da 001.
+    app_key_evento = str(payload.get('appKey') or '').strip()
+    if app_key_evento and app_key_evento != APP_KEY_ORIGEM:
+        print("Evento de outro aplicativo Omie ignorado (a replicacao so le pedidos da 001).")
+        return jsonify({"status": "ignorado_outra_empresa"}), 200
+
     topic = str(payload.get('topic', '')).strip().lower()
     etapa_atual = str(mensagem.get('etapa', '')).strip()
     eh_inclusao = topic in {'vendaproduto.incluida', 'vendaproduto.incluido'}
@@ -656,6 +681,10 @@ def receber_webhook():
         return jsonify({"status": "pedido_invalido"}), 400
     if codigo_pedido <= 0:
         return jsonify({"status": "pedido_invalido"}), 400
+
+    if bloqueio_restante():
+        # A Omie reenvia o evento depois; nenhuma chamada e feita durante o bloqueio.
+        return jsonify({"status": "api_bloqueada"}), 503
 
     with _lock:
         if codigo_pedido in _pedidos_em_processamento:
